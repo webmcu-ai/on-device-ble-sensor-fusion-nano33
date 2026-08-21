@@ -1,0 +1,1614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebBLE Dual Board Control - Nano33 + ESP32S3 - v11</title>
+<script src="https://cdn.plot.ly/plotly-1.47.4.min.js"></script>
+</head>
+<body>
+
+<h1 align=center>WebBLE Dual Board Control - v11</h1>
+<h3 align=center>Nano 33 BLE Sense (peripheral, inference-only) + XIAO ESP32S3 (dual role: central to Nano33, peripheral to this page)</h3>
+<h6>Uses Web Bluetooth directly for the boards - Chrome or Edge on Windows/Mac/Linux/ChromeOS/Android only. Phone
+motion training below uses a separate, plain-web-standards API (DeviceMotionEvent) that also works in mobile Safari.</h6>
+
+<p>
+This page can <b>train a model right here in the browser</b>, using the identical Conv1D+Dense+Dense+Output
+architecture both boards run, then <b>push the trained weights to either board</b>. The Nano33 never trains -
+it only ever receives a finished model (from the ESP32, from this page, or baked in at compile time) and runs
+inference locally, reporting results back over BLE. Quick and full inference both work everywhere.
+</p>
+<p>
+<b>What's new in v11 - requires nano33-v11.ino (esp32 firmware still untouched):</b>
+</p>
+<ul>
+<li><b>Fixed model push hanging on the Nano33 after the first chunk.</b> Its ~500ms heartbeat notify could land
+while a chunked model write from this page was still in flight, which can stall a Web Bluetooth write indefinitely
+on some OS Bluetooth stacks - exactly the "Model RX: 180/23488 bytes (0%)" then nothing symptom. The Nano33 now
+pauses its heartbeat for the duration of a model push (and has a 5s stale-transfer watchdog so a stuck push can't
+permanently block the next attempt). The push button here now also paces chunks, retries a single failed chunk
+once, and logs progress to the log box below (not just the progress bar) so a real hang is easy to spot.</li>
+<li><b>Phone: Start/Stop Continuous Inference.</b> A new toggle button on the phone panel repeatedly captures a
+fresh 1s motion window and runs browser inference on it automatically (~1x/second) until you press it again -
+no more manually pressing Capture then Run Browser Inference for every reading.</li>
+</ul>
+<p>
+<b>What was new in v09:</b> "Save myFusionWeights.h" button to bake a model into either sketch at compile time
+(<code>USE_BAKED_WEIGHTS</code>), phone-motion training via DeviceMotionEvent, "Capture Labeled Sample" now
+actively triggers a fresh capture on whichever source is selected instead of relabeling a stale reading, and a
+"Run Browser Inference" button on every panel (the only way to get a prediction for phone data, and a useful
+cross-check for the boards' on-device BLE result path).
+</p>
+
+<script>
+   // ======================================================
+   // Shared BLE config - MUST match nano33-v05.ino and esp32-v05.ino exactly
+   // ======================================================
+   const MY_BLE_SERVICE_UUID        = '7e400001-b2c3-5d4e-af60-9b3c7d8eaf20'
+   const MY_BLE_CONTROL_CHAR_UUID   = '7e400002-b2c3-5d4e-af60-9b3c7d8eaf20'  // write:  browser -> board
+   const MY_BLE_HEARTBEAT_CHAR_UUID = '7e400003-b2c3-5d4e-af60-9b3c7d8eaf20'  // notify: board -> browser, ~2Hz
+   const MY_BLE_BINARY_CHAR_UUID    = '7e400004-b2c3-5d4e-af60-9b3c7d8eaf20'  // indicate: board -> browser, chunked
+   const MY_BLE_MODEL_CHAR_UUID     = '7e400005-b2c3-5d4e-af60-9b3c7d8eaf20'  // [NEW v02] write, chunked: browser -> board, model push
+   const MY_BLE_RESULT_CHAR_UUID    = '7e400006-b2c3-5d4e-af60-9b3c7d8eaf20'  // [NEW v02] notify: board -> browser, inference result
+
+   const MY_FAST_CHANNELS  = 10   // ax,ay,az,gx,gy,gz,mx,my,mz,mic
+   const MY_FAST_LABELS    = ['ax','ay','az','gx','gy','gz','mx','my','mz','mic']
+   const MY_STATIC_LABELS  = ['pressure','temp','humidity','prox','colorR','colorG','colorB']
+   const MY_IMU_TIMESTEPS  = 40
+   const MY_SAMPLE_INTERVAL_MS = 25   // [NEW v09] matches both boards' SAMPLE_INTERVAL_MS - used to time phone-motion capture
+   const MY_HEART_MAXPTS   = 60   // rolling window length for the heartbeat chart
+
+   // ======================================================
+   // [NEW v02] NETWORK ARCHITECTURE - must be byte-for-byte identical to
+   // esp32-v05.ino / nano33-v05.ino so a browser-trained model is a drop-in
+   // replacement for an ESP32-trained one and vice versa:
+   //   Conv1D(k=5,f=8) -> MaxPool/2 -> flatten(144) ++ static(7)
+   //   = 151 -> Dense(32) -> Dense(16) -> Output(NUM_CLASSES, softmax)
+   // ======================================================
+   const NUM_CLASSES     = 3
+   const MY_CLASS_LABELS = ['0unknown', '1normal', '2issue']   // TUNE-ME: keep in sync with esp32-v05.ino's myClassLabels
+   const CONV1_KERNEL    = 5
+   const CONV1_FILTERS   = 8
+   const CONV1_OUT_STEPS = MY_IMU_TIMESTEPS - CONV1_KERNEL + 1        // 36
+   const POOL1_STEPS     = Math.floor(CONV1_OUT_STEPS / 2)            // 18
+   const CONV1_FLAT      = POOL1_STEPS * CONV1_FILTERS                // 144
+   const COMBINED_SIZE   = CONV1_FLAT + MY_STATIC_LABELS.length       // 151
+   const CONV1_WEIGHTS   = CONV1_KERNEL * MY_FAST_CHANNELS * CONV1_FILTERS  // 400
+   const DENSE1_SIZE     = 32
+   const DENSE2_SIZE     = 16
+   const DENSE1_WEIGHTS  = COMBINED_SIZE * DENSE1_SIZE                // 4832
+   const DENSE2_WEIGHTS  = DENSE1_SIZE * DENSE2_SIZE                  // 512
+   const OUTPUT_WEIGHTS  = DENSE2_SIZE * NUM_CLASSES                  // 48
+
+   // Static-feature normalization - MUST match the firmware's fixed
+   // baseline/scale constants exactly (these are not learned).
+   const MY_PRESSURE_BASELINE = 101.0, MY_PRESSURE_SCALE = 5.0
+   const MY_TEMP_BASELINE = 20.0,      MY_TEMP_SCALE = 10.0
+   const MY_HUMIDITY_BASELINE = 50.0,  MY_HUMIDITY_SCALE = 25.0
+   const MY_PROX_SCALE = 255.0, MY_COLOR_SCALE = 255.0
+
+   // Model package layout - see PROTOCOL CONTRACT comments in both .ino files
+   const MY_MODEL_PACKAGE_FLOATS = 1 + CONV1_WEIGHTS + CONV1_FILTERS + DENSE1_WEIGHTS + DENSE1_SIZE +
+                                    DENSE2_WEIGHTS + DENSE2_SIZE + OUTPUT_WEIGHTS + NUM_CLASSES +
+                                    MY_FAST_CHANNELS + MY_FAST_CHANNELS
+   const MY_MODEL_PACKAGE_BYTES = MY_MODEL_PACKAGE_FLOATS * 4
+
+   // one state object per board, everything keyed off 'nano' or 'esp'
+   let myBoards = {
+      nano: { device:null, server:null, service:null, controlChar:null, heartbeatChar:null, binaryChar:null,
+              modelChar:null, resultChar:null,
+              connected:false, receiving:false, expectedBytes:0, receivedBytes:0, chunks:[],
+              heartT:0, heart:{ax:[],ay:[],az:[],mic:[],temp:[],hum:[],prox:[]} },
+      esp:  { device:null, server:null, service:null, controlChar:null, heartbeatChar:null, binaryChar:null,
+              modelChar:null, resultChar:null,
+              connected:false, receiving:false, expectedBytes:0, receivedBytes:0, chunks:[],
+              heartT:0, heart:{ax:[],ay:[],az:[],mic:[],temp:[],hum:[],prox:[]} }
+   }
+
+   // Most-recently-decoded raw window per board (407 or 17 floats),
+   // kept around so the "Capture Labeled Sample" button can stash it
+   // into the browser-side training set on demand.
+   let myLastWindow = { nano:null, esp:null, phone:null }   // [NEW v09] 'phone' added for DeviceMotion-based capture
+
+   function myLog(myMsg){
+      let myD = new Date()
+      let myStamp = myD.toLocaleTimeString()
+      document.getElementById('myLogArea').value += `[${myStamp}] ${myMsg}\n`
+      document.getElementById('myLogArea').scrollTop = document.getElementById('myLogArea').scrollHeight
+   }
+
+   // ======================================================
+   // CONNECT / DISCONNECT
+   // ======================================================
+   async function myConnectBoard(myKey){
+      if (!navigator.bluetooth){
+         alert('Web Bluetooth not supported in this browser. Use Chrome or Edge.')
+         return
+      }
+      let myPrefix = document.getElementById('myPrefix_' + myKey).value
+      try {
+         myLog(`${myKey}: requesting device with name prefix "${myPrefix}" ...`)
+         let myDevice = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: myPrefix }],
+            optionalServices: [MY_BLE_SERVICE_UUID]
+         })
+         myBoards[myKey].device = myDevice
+         myDevice.addEventListener('gattserverdisconnected', function(){ myOnDisconnected(myKey) })
+
+         myLog(`${myKey}: connecting to GATT server ...`)
+         let myServer = await myDevice.gatt.connect()
+         myBoards[myKey].server = myServer
+
+         let myService = await myServer.getPrimaryService(MY_BLE_SERVICE_UUID)
+         myBoards[myKey].service = myService
+
+         myBoards[myKey].controlChar = await myService.getCharacteristic(MY_BLE_CONTROL_CHAR_UUID)
+
+         myBoards[myKey].heartbeatChar = await myService.getCharacteristic(MY_BLE_HEARTBEAT_CHAR_UUID)
+         await myBoards[myKey].heartbeatChar.startNotifications()
+         myBoards[myKey].heartbeatChar.addEventListener('characteristicvaluechanged', function(myEvent){ myHandleHeartbeat(myKey, myEvent) })
+
+         myBoards[myKey].binaryChar = await myService.getCharacteristic(MY_BLE_BINARY_CHAR_UUID)
+         await myBoards[myKey].binaryChar.startNotifications()
+         myBoards[myKey].binaryChar.addEventListener('characteristicvaluechanged', function(myEvent){ myHandleBinary(myKey, myEvent) })
+
+         // [NEW v02] model write + result notify - optional, don't fail
+         // the whole connect if an older firmware doesn't have them yet.
+         try {
+            myBoards[myKey].modelChar = await myService.getCharacteristic(MY_BLE_MODEL_CHAR_UUID)
+         } catch (myErr) { myLog(`${myKey}: no model characteristic (older firmware?) - model push disabled`) }
+
+         try {
+            myBoards[myKey].resultChar = await myService.getCharacteristic(MY_BLE_RESULT_CHAR_UUID)
+            await myBoards[myKey].resultChar.startNotifications()
+            myBoards[myKey].resultChar.addEventListener('characteristicvaluechanged', function(myEvent){ myHandleResult(myKey, myEvent) })
+         } catch (myErr) { myLog(`${myKey}: no result characteristic (older firmware?) - on-device result display disabled`) }
+
+         myBoards[myKey].connected = true
+         document.getElementById('myStatus_' + myKey).textContent = 'Connected: ' + myDevice.name
+         document.getElementById('myStatus_' + myKey).style.color = 'green'
+         myLog(`${myKey}: connected to ${myDevice.name}`)
+
+      } catch (myErr) {
+         myLog(`${myKey}: connect error - ${myErr}`)
+         document.getElementById('myStatus_' + myKey).textContent = 'Connect failed'
+         document.getElementById('myStatus_' + myKey).style.color = 'red'
+      }
+   }
+
+   function myOnDisconnected(myKey){
+      myBoards[myKey].connected = false
+      document.getElementById('myStatus_' + myKey).textContent = 'Disconnected'
+      document.getElementById('myStatus_' + myKey).style.color = 'red'
+      myLog(`${myKey}: gatt server disconnected`)
+   }
+
+   function myDisconnectBoard(myKey){
+      if (myBoards[myKey].device && myBoards[myKey].device.gatt.connected){
+         myBoards[myKey].device.gatt.disconnect()
+      }
+   }
+
+   // ======================================================
+   // SEND A CONTROL COMMAND (CAPTURE, QUICK, TRAIN, INFER, QUICKINFER,
+   // PUSHTONANO, PUSHMODEL, or any custom string)
+   // ======================================================
+   async function myWriteControl(myKey, myCmd){
+      if (!myBoards[myKey].connected){
+         myLog(`${myKey}: not connected, cannot send "${myCmd}"`)
+         return
+      }
+      try {
+         let myEncoder = new TextEncoder()
+         await myBoards[myKey].controlChar.writeValue(myEncoder.encode(myCmd))
+         myLog(`${myKey}: sent "${myCmd}"`)
+      } catch (myErr) {
+         myLog(`${myKey}: write error - ${myErr}`)
+      }
+   }
+
+   function mySendCustom(myKey){
+      let myCmd = document.getElementById('myCustomCmd_' + myKey).value
+      myWriteControl(myKey, myCmd)
+   }
+
+   // ======================================================
+   // HEARTBEAT: compact CSV "ax,ay,az,mic,temp,hum,prox" every ~500ms
+   // ======================================================
+   function myHandleHeartbeat(myKey, myEvent){
+      let myDecoder = new TextDecoder()
+      let myText = myDecoder.decode(myEvent.target.value)
+      let myParts = myText.split(',').map(function(myV){ return parseFloat(myV) })
+      if (myParts.length < 7) { myLog(`${myKey}: bad heartbeat "${myText}"`); return }
+
+      let myH = myBoards[myKey].heart
+      myH.ax.push(myParts[0]);   myH.ay.push(myParts[1]);   myH.az.push(myParts[2])
+      myH.mic.push(myParts[3]);  myH.temp.push(myParts[4]); myH.hum.push(myParts[5]); myH.prox.push(myParts[6])
+      // keep rolling window
+      Object.keys(myH).forEach(function(myCh){ if (myH[myCh].length > MY_HEART_MAXPTS) myH[myCh].shift() })
+
+      document.getElementById('myHeartText_' + myKey).textContent =
+         `ax:${myParts[0]} ay:${myParts[1]} az:${myParts[2]} mic:${myParts[3]} temp:${myParts[4]} hum:${myParts[5]} prox:${myParts[6]}`
+
+      myUpdateHeartChart(myKey)
+   }
+
+   function myUpdateHeartChart(myKey){
+      let myH = myBoards[myKey].heart
+      let myX = Array.from(Array(myH.ax.length).keys())
+      let myTraces = [
+         { x: myX, y: myH.ax,  mode:'lines', name:'accelX' },
+         { x: myX, y: myH.ay,  mode:'lines', name:'accelY' },
+         { x: myX, y: myH.az,  mode:'lines', name:'accelZ' },
+         { x: myX, y: myH.mic, mode:'lines', name:'mic', yaxis:'y2' },
+         { x: myX, y: myH.temp,mode:'lines', name:'temp' },
+         { x: myX, y: myH.hum, mode:'lines', name:'humidity' },
+         { x: myX, y: myH.prox,mode:'lines', name:'proximity' }
+      ]
+      let myLayout = {
+         title: 'Heartbeat (live, ~2Hz)',
+         height: 300,
+         xaxis: { title:'sample #' },
+         yaxis: { title:'accel / temp / hum / prox' },
+         yaxis2: { title:'mic', overlaying:'y', side:'right' },
+         margin: { t:40 }
+      }
+      Plotly.react('myHeartChart_' + myKey, myTraces, myLayout)
+   }
+
+   // ======================================================
+   // BINARY WINDOW: 4-byte LE size header, then raw float32LE chunks
+   // (matches myBLESendBuffer()/myServerSendBinary() in the firmware).
+   // [NEW v02] Also handles a full MODEL PACKAGE arriving this way
+   // (e.g. after sending "PUSHMODEL" to the ESP32) - routed by size.
+   // ======================================================
+   function myHandleBinary(myKey, myEvent){
+      let myB = myBoards[myKey]
+      let myValue = myEvent.target.value   // DataView
+
+      if (!myB.receiving){
+         if (myValue.byteLength === 4){
+            myB.expectedBytes = myValue.getUint32(0, true)
+            myB.receivedBytes = 0
+            myB.chunks = []
+            myB.receiving = true
+            myLog(`${myKey}: binary transfer starting, expecting ${myB.expectedBytes} bytes`)
+         } else {
+            myLog(`${myKey}: unexpected binary packet (${myValue.byteLength} bytes) while idle, ignoring`)
+         }
+         return
+      }
+
+      let myChunk = new Uint8Array(myValue.buffer, myValue.byteOffset, myValue.byteLength)
+      myB.chunks.push(myChunk)
+      myB.receivedBytes += myChunk.byteLength
+
+      if (myB.receivedBytes >= myB.expectedBytes){
+         myB.receiving = false
+         let myFull = new Uint8Array(myB.receivedBytes)
+         let myOffset = 0
+         myB.chunks.forEach(function(myC){ myFull.set(myC, myOffset); myOffset += myC.byteLength })
+         myLog(`${myKey}: binary transfer complete, ${myB.receivedBytes} bytes`)
+
+         if (myB.receivedBytes === MY_MODEL_PACKAGE_BYTES) {
+            myLastReceivedModelBytes = myFull   // [NEW v02] stash so "Push to Nano33" can relay it verbatim
+            myModelInfo = { source: `fetched from ${myKey}`, paramCount: MY_MODEL_PACKAGE_FLOATS - 1,
+                             bytes: MY_MODEL_PACKAGE_BYTES, ts: new Date().toLocaleTimeString() }
+            myUpdateModelInfoPanel()
+            myLog(`${myKey}: that was a MODEL PACKAGE, not a sensor window - use "Relay Model to Nano33" to forward it`)
+         } else {
+            myDecodeWindow(myKey, myFull)
+         }
+      }
+   }
+
+   function myDecodeWindow(myKey, myBytes){
+      let myView = new DataView(myBytes.buffer)
+      let myFloatCount = myBytes.byteLength / 4
+      let myFloats = []
+      for (let myI = 0; myI < myFloatCount; myI++){
+         myFloats.push(myView.getFloat32(myI * 4, true))
+      }
+
+      if (myFloatCount === (MY_IMU_TIMESTEPS * MY_FAST_CHANNELS + MY_STATIC_LABELS.length)) {
+         // full 1-second window: 40 timesteps x 10 fast channels + 7 static
+         myLastWindow[myKey] = myFloats   // [NEW v02] keep for "Capture Labeled Sample"
+         let myFastSize = MY_IMU_TIMESTEPS * MY_FAST_CHANNELS
+         let myLineData = []
+         for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++) myLineData.push([])
+         for (let myT = 0; myT < MY_IMU_TIMESTEPS; myT++){
+            for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++){
+               myLineData[myCh].push(myFloats[myT * MY_FAST_CHANNELS + myCh])
+            }
+         }
+         let myStaticVals = myFloats.slice(myFastSize)
+         myUpdateWindowChart(myKey, myLineData, 'Full window (40 timesteps)')
+         myShowStatic(myKey, myStaticVals)
+         myMaybeResolvePendingCapture(myKey)   // [NEW v09] finishes a "Capture Labeled Sample" click, if one is waiting
+
+      } else if (myFloatCount === (MY_FAST_CHANNELS + MY_STATIC_LABELS.length)) {
+         // QUICK: single instant reading, no time axis - replicate to a
+         // full window immediately so it's just as trainable/labelable
+         // as a real CAPTURE (mirrors myBuildWindowFromQuick() in both .ino files).
+         myLastWindow[myKey] = myBuildWindowFromQuick(myFloats)
+         let myLineData = []
+         for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++) myLineData.push([myFloats[myCh]])
+         let myStaticVals = myFloats.slice(MY_FAST_CHANNELS)
+         myUpdateWindowChart(myKey, myLineData, 'Quick reading (single sample)')
+         myShowStatic(myKey, myStaticVals)
+         myMaybeResolvePendingCapture(myKey)   // [NEW v09]
+
+      } else {
+         myLog(`${myKey}: got ${myFloatCount} floats, does not match a known packet shape, showing raw`)
+         document.getElementById('myStatic_' + myKey).textContent = myFloats.join(', ')
+      }
+   }
+
+   function myUpdateWindowChart(myKey, myLineData, myTitle){
+      let myTraces = myLineData.map(function(myArr, myI){
+         return { x: Array.from(Array(myArr.length).keys()), y: myArr, mode: (myArr.length > 1 ? 'lines' : 'markers'), name: MY_FAST_LABELS[myI] }
+      })
+      let myLayout = { title: myTitle, height: 300, xaxis:{title:'timestep'}, yaxis:{title:'value'}, margin:{t:40} }
+      Plotly.newPlot('myWindowChart_' + myKey, myTraces, myLayout)
+   }
+
+   function myShowStatic(myKey, myVals){
+      let myOut = MY_STATIC_LABELS.map(function(myLbl, myI){ return `${myLbl}: ${myVals[myI]}` }).join('  ')
+      document.getElementById('myStatic_' + myKey).textContent = myOut
+   }
+
+   // ======================================================
+   // [NEW v02] ON-DEVICE INFERENCE RESULT: index-based CSV
+   // "predIdx,conf,p0,p1,...,pN-1" from RESULT_CHAR notify.
+   // Works the same whether it came from the ESP32's own trainer or
+   // the Nano33 running a pushed model.
+   // ======================================================
+   function myHandleResult(myKey, myEvent){
+      let myDecoder = new TextDecoder()
+      let myText = myDecoder.decode(myEvent.target.value)
+      let myParts = myText.split(',').map(parseFloat)
+      if (myParts.length < 2) { myLog(`${myKey}: bad result "${myText}"`); return }
+      let myPred = myParts[0]
+      let myProbs = myParts.slice(1)
+      let myLabel = MY_CLASS_LABELS[myPred] || ('class#' + myPred)
+      let myOut = `${myLabel}  (` + myProbs.map(function(myP, myI){
+         return `${MY_CLASS_LABELS[myI] || myI}=${(myP*100).toFixed(0)}%`
+      }).join(', ') + ')'
+      document.getElementById('myResult_' + myKey).textContent = myOut
+      myLog(`${myKey}: on-device result -> ${myOut}`)
+   }
+
+   // ======================================================
+   // [NEW v02] BROWSER-SIDE TRAINING
+   // Same architecture as both boards. Dataset lives entirely in JS
+   // memory (array of {window: Float32Array(407), label: int}).
+   // Training uses plain SGD (not Adam like the ESP32) to keep this
+   // single-file, no-build-tools, easy to read - fine for the small
+   // datasets a manual labeling session produces. Weight layout is
+   // IDENTICAL to the firmware's, so the result loads straight into
+   // either board.
+   // ======================================================
+   let myDataset = []              // {window: Array[407], label: int, source: 'nano'|'esp', ts: string}
+   let myModel = null              // populated by myInitModel()
+   let myModelInfo = null          // {source: string, paramCount: int, bytes: int, ts: string} - for the info panel
+   let myTraining = false
+   let myLastReceivedModelBytes = null   // set when a MODEL PACKAGE arrives via myHandleBinary
+   let myCalibWindow = null        // [NEW v08] raw window (407 floats) used as the calibration baseline, same
+                                    // role as the ESP32's boot-time "keep still" capture. Fixes a v02-v05 bug
+                                    // where calibration was instead derived from the whole (multi-class) training
+                                    // set, which does not match what the firmware does and made browser-trained
+                                    // models behave badly once pushed to a board.
+   let myLossHistory = []          // [NEW v08] {epoch, loss, acc} per epoch, for the live training chart
+
+   function myBuildWindowFromQuick(myQuickFloats){
+      // replicate one QUICK reading across all timesteps, same trick
+      // esp32-v05.ino / nano33-v05.ino use for their own "quick infer"
+      let myOut = new Array(MY_IMU_TIMESTEPS * MY_FAST_CHANNELS + MY_STATIC_LABELS.length)
+      for (let myT = 0; myT < MY_IMU_TIMESTEPS; myT++){
+         for (let myC = 0; myC < MY_FAST_CHANNELS; myC++){
+            myOut[myT * MY_FAST_CHANNELS + myC] = myQuickFloats[myC]
+         }
+      }
+      for (let myS = 0; myS < MY_STATIC_LABELS.length; myS++){
+         myOut[MY_IMU_TIMESTEPS * MY_FAST_CHANNELS + myS] = myQuickFloats[MY_FAST_CHANNELS + myS]
+      }
+      return myOut
+   }
+
+   function myRandInit(mySize, myStd){
+      let myArr = new Float32Array(mySize)
+      for (let myI = 0; myI < mySize; myI++) myArr[myI] = (Math.random() - 0.5) * 2 * myStd
+      return myArr
+   }
+
+   function myInitModel(){
+      myModel = {
+         conv1_w: myRandInit(CONV1_WEIGHTS, Math.sqrt(2 / (CONV1_KERNEL * MY_FAST_CHANNELS))),
+         conv1_b: new Float32Array(CONV1_FILTERS),
+         dense1_w: myRandInit(DENSE1_WEIGHTS, Math.sqrt(2 / COMBINED_SIZE)),
+         dense1_b: new Float32Array(DENSE1_SIZE),
+         dense2_w: myRandInit(DENSE2_WEIGHTS, Math.sqrt(2 / DENSE1_SIZE)),
+         dense2_b: new Float32Array(DENSE2_SIZE),
+         output_w: myRandInit(OUTPUT_WEIGHTS, Math.sqrt(2 / DENSE2_SIZE)),
+         output_b: new Float32Array(NUM_CLASSES),
+         calibMean: new Float32Array(MY_FAST_CHANNELS),
+         calibStd:  new Float32Array(MY_FAST_CHANNELS).fill(1)
+      }
+      myLog('browser: model (re)initialized with random weights')
+   }
+
+   function myLeakyRelu(myX){ return myX > 0 ? myX : 0.1 * myX }
+   function myLeakyReluDeriv(myX){ return myX > 0 ? 1.0 : 0.1 }
+   function myClip(myV, myMn, myMx){
+      if (isNaN(myV) || !isFinite(myV)) return 0
+      return Math.min(Math.max(myV, myMn), myMx)
+   }
+   function mySoftmax(myArr){
+      let myMax = Math.max(...myArr)
+      let myExp = myArr.map(function(myV){ return Math.exp(myV - myMax) })
+      let mySum = myExp.reduce(function(myA, myB){ return myA + myB }, 0)
+      return myExp.map(function(myV){ return myV / mySum })
+   }
+
+   // [FIXED v08] Compute calibration mean/std the SAME way the ESP32 does at
+   // boot (myCalibrate() in esp32_v08.ino): mean/std of each fast channel
+   // over ONE window, captured while the sensor/machine is quiet/neutral -
+   // NOT averaged across the whole multi-class training set. Mixing every
+   // class together for "calibration" made the normalized ranges the model
+   // trained on unrelated to what the firmware produces at inference time,
+   // which is why browser-trained models looked fine in the browser but did
+   // not work once pushed to a board. Call myUseLastReadingAsCalibBaseline()
+   // first (or capture one manually) before training.
+   function myCalibrateFromWindow(myWindow){
+      for (let myC = 0; myC < MY_FAST_CHANNELS; myC++){
+         let mySum = 0, mySum2 = 0, myN = 0
+         for (let myT = 0; myT < MY_IMU_TIMESTEPS; myT++){
+            let myV = myWindow[myT * MY_FAST_CHANNELS + myC]
+            mySum += myV; mySum2 += myV * myV; myN++
+         }
+         let myMean = mySum / myN
+         let myVar = (mySum2 / myN) - (myMean * myMean)
+         myModel.calibMean[myC] = myMean
+         myModel.calibStd[myC] = Math.max(Math.sqrt(Math.max(myVar, 0)), 0.01)
+      }
+   }
+
+   function myUseLastReadingAsCalibBaseline(){
+      let myKey = document.getElementById('myTrainSourceBoard').value
+      if (!myLastWindow[myKey]) {
+         myLog(`browser: no window captured yet from "${myKey}" - press Capture/Quick on that panel first, ideally while the sensor is quiet/neutral`)
+         return
+      }
+      myCalibWindow = myLastWindow[myKey].slice()
+      document.getElementById('myCalibStatus').textContent = `baseline set from "${myKey}" at ${new Date().toLocaleTimeString()}`
+      document.getElementById('myCalibStatus').style.color = 'green'
+      myLog(`browser: calibration baseline captured from "${myKey}" - this will be used for training/normalization instead of the mixed-class fallback`)
+   }
+
+   // Prepares myModel.calibMean/Std right before training. Prefers the
+   // explicit baseline window (matches firmware behavior exactly); falls
+   // back to the old mixed-dataset estimate ONLY if no baseline was set,
+   // with a clear warning since that fallback is what caused the v02-v05 bug.
+   function myCalibrateFromDataset(){
+      if (myCalibWindow){
+         myCalibrateFromWindow(myCalibWindow)
+         myLog('browser: calibration using the dedicated baseline window (matches firmware behavior)')
+         return
+      }
+      if (myDataset.length === 0) return
+      myLog('browser: WARNING - no calibration baseline set (use "Set Calibration Baseline" above the dataset). ' +
+            'Falling back to averaging across the whole training set, which does NOT match the firmware and is ' +
+            'the most likely reason a browser-trained model misbehaves once pushed to a board.')
+      for (let myC = 0; myC < MY_FAST_CHANNELS; myC++){
+         let mySum = 0, mySum2 = 0, myN = 0
+         myDataset.forEach(function(myItem){
+            for (let myT = 0; myT < MY_IMU_TIMESTEPS; myT++){
+               let myV = myItem.window[myT * MY_FAST_CHANNELS + myC]
+               mySum += myV; mySum2 += myV * myV; myN++
+            }
+         })
+         let myMean = mySum / myN
+         let myVar = (mySum2 / myN) - (myMean * myMean)
+         myModel.calibMean[myC] = myMean
+         myModel.calibStd[myC] = Math.max(Math.sqrt(Math.max(myVar, 0)), 0.01)
+      }
+   }
+
+   function myNormalizeWindow(myRaw, myModelObj){
+      myModelObj = myModelObj || myModel
+      let myBuf = myRaw.slice()
+      for (let myT = 0; myT < MY_IMU_TIMESTEPS; myT++){
+         for (let myC = 0; myC < MY_FAST_CHANNELS; myC++){
+            let myIdx = myT * MY_FAST_CHANNELS + myC
+            myBuf[myIdx] = myClip((myBuf[myIdx] - myModelObj.calibMean[myC]) / (myModelObj.calibStd[myC] + 1e-8), -5, 5)
+         }
+      }
+      let myFastSize = MY_IMU_TIMESTEPS * MY_FAST_CHANNELS
+      myBuf[myFastSize+0] = myClip((myBuf[myFastSize+0] - MY_PRESSURE_BASELINE) / MY_PRESSURE_SCALE, -5, 5)
+      myBuf[myFastSize+1] = myClip((myBuf[myFastSize+1] - MY_TEMP_BASELINE) / MY_TEMP_SCALE, -5, 5)
+      myBuf[myFastSize+2] = myClip((myBuf[myFastSize+2] - MY_HUMIDITY_BASELINE) / MY_HUMIDITY_SCALE, -5, 5)
+      myBuf[myFastSize+3] = myClip(myBuf[myFastSize+3] / MY_PROX_SCALE, 0, 5)
+      myBuf[myFastSize+4] = myClip(myBuf[myFastSize+4] / MY_COLOR_SCALE, 0, 5)
+      myBuf[myFastSize+5] = myClip(myBuf[myFastSize+5] / MY_COLOR_SCALE, 0, 5)
+      myBuf[myFastSize+6] = myClip(myBuf[myFastSize+6] / MY_COLOR_SCALE, 0, 5)
+      return myBuf
+   }
+
+   // Forward pass, returns {conv1, pool1, combined, dense1, dense2, final, probs}
+   // so backprop below can reuse every intermediate activation.
+   // [CHANGED v09] takes an explicit myModelObj (defaults to the global
+   // myModel used during training) so myRunBrowserInference() below can
+   // also run this against a model that was only ever loaded/fetched as
+   // raw bytes (myGetCurrentModelForExport()), never trained in this tab.
+   function myForwardPass(myNormBuf, myModelObj){
+      myModelObj = myModelObj || myModel
+      let myConv1 = new Float32Array(CONV1_OUT_STEPS * CONV1_FILTERS)
+      for (let myS = 0; myS < CONV1_OUT_STEPS; myS++){
+         for (let myF = 0; myF < CONV1_FILTERS; myF++){
+            let mySum = myModelObj.conv1_b[myF]
+            for (let myK = 0; myK < CONV1_KERNEL; myK++){
+               for (let myC = 0; myC < MY_FAST_CHANNELS; myC++){
+                  mySum += myNormBuf[(myS+myK)*MY_FAST_CHANNELS+myC] *
+                           myModelObj.conv1_w[(myK*MY_FAST_CHANNELS+myC)*CONV1_FILTERS+myF]
+               }
+            }
+            myConv1[myS*CONV1_FILTERS+myF] = myLeakyRelu(mySum)
+         }
+      }
+      let myPool1 = new Float32Array(CONV1_FLAT)
+      let myPoolArgmax = new Int8Array(POOL1_STEPS * CONV1_FILTERS)   // 0 or 1, which of the pair won - needed for backprop
+      for (let myS = 0; myS < POOL1_STEPS; myS++){
+         for (let myF = 0; myF < CONV1_FILTERS; myF++){
+            let myA = myConv1[(myS*2)*CONV1_FILTERS+myF]
+            let myB = myConv1[(myS*2+1)*CONV1_FILTERS+myF]
+            let myWin = myA >= myB ? 0 : 1
+            myPoolArgmax[myS*CONV1_FILTERS+myF] = myWin
+            myPool1[myS*CONV1_FILTERS+myF] = myWin === 0 ? myA : myB
+         }
+      }
+      let myCombined = new Float32Array(COMBINED_SIZE)
+      myCombined.set(myPool1, 0)
+      for (let myI = 0; myI < MY_STATIC_LABELS.length; myI++) myCombined[CONV1_FLAT+myI] = myNormBuf[MY_IMU_TIMESTEPS*MY_FAST_CHANNELS+myI]
+
+      let myDense1 = new Float32Array(DENSE1_SIZE)
+      for (let myJ = 0; myJ < DENSE1_SIZE; myJ++){
+         let mySum = myModelObj.dense1_b[myJ]
+         for (let myI = 0; myI < COMBINED_SIZE; myI++) mySum += myCombined[myI] * myModelObj.dense1_w[myI*DENSE1_SIZE+myJ]
+         myDense1[myJ] = myLeakyRelu(mySum)
+      }
+      let myDense2 = new Float32Array(DENSE2_SIZE)
+      for (let myJ = 0; myJ < DENSE2_SIZE; myJ++){
+         let mySum = myModelObj.dense2_b[myJ]
+         for (let myI = 0; myI < DENSE1_SIZE; myI++) mySum += myDense1[myI] * myModelObj.dense2_w[myI*DENSE2_SIZE+myJ]
+         myDense2[myJ] = myLeakyRelu(mySum)
+      }
+      let myFinal = new Float32Array(NUM_CLASSES)
+      for (let myJ = 0; myJ < NUM_CLASSES; myJ++){
+         let mySum = myModelObj.output_b[myJ]
+         for (let myI = 0; myI < DENSE2_SIZE; myI++) mySum += myDense2[myI] * myModelObj.output_w[myI*NUM_CLASSES+myJ]
+         myFinal[myJ] = mySum
+      }
+      let myProbs = mySoftmax(Array.from(myFinal))
+      return { conv1:myConv1, pool1:myPool1, poolArgmax:myPoolArgmax, combined:myCombined,
+               dense1:myDense1, dense2:myDense2, final:myFinal, probs:myProbs }
+   }
+
+   // One SGD step on a single labeled sample. Cross-entropy loss,
+   // softmax output, leaky-relu everywhere else - same loss shape as
+   // esp32-v05.ino's myBackwardPass, simplified to plain SGD.
+   function myTrainStep(myNormBuf, myLabel, myLr){
+      let myFwd = myForwardPass(myNormBuf)
+
+      // output layer delta = probs - onehot(label)
+      let myOutDelta = myFwd.probs.slice()
+      myOutDelta[myLabel] -= 1
+
+      // output weights/bias
+      for (let myJ = 0; myJ < NUM_CLASSES; myJ++){
+         myModel.output_b[myJ] -= myLr * myOutDelta[myJ]
+         for (let myI = 0; myI < DENSE2_SIZE; myI++){
+            myModel.output_w[myI*NUM_CLASSES+myJ] -= myLr * myOutDelta[myJ] * myFwd.dense2[myI]
+         }
+      }
+      // dense2 delta
+      let myD2Delta = new Float32Array(DENSE2_SIZE)
+      for (let myI = 0; myI < DENSE2_SIZE; myI++){
+         let mySum = 0
+         for (let myJ = 0; myJ < NUM_CLASSES; myJ++) mySum += myOutDelta[myJ] * myModel.output_w[myI*NUM_CLASSES+myJ]
+         myD2Delta[myI] = mySum * myLeakyReluDeriv(myFwd.dense2[myI])
+      }
+      for (let myJ = 0; myJ < DENSE2_SIZE; myJ++){
+         myModel.dense2_b[myJ] -= myLr * myD2Delta[myJ]
+         for (let myI = 0; myI < DENSE1_SIZE; myI++){
+            myModel.dense2_w[myI*DENSE2_SIZE+myJ] -= myLr * myD2Delta[myJ] * myFwd.dense1[myI]
+         }
+      }
+      // dense1 delta
+      let myD1Delta = new Float32Array(DENSE1_SIZE)
+      for (let myI = 0; myI < DENSE1_SIZE; myI++){
+         let mySum = 0
+         for (let myJ = 0; myJ < DENSE2_SIZE; myJ++) mySum += myD2Delta[myJ] * myModel.dense2_w[myI*DENSE2_SIZE+myJ]
+         myD1Delta[myI] = mySum * myLeakyReluDeriv(myFwd.dense1[myI])
+      }
+      for (let myJ = 0; myJ < DENSE1_SIZE; myJ++){
+         myModel.dense1_b[myJ] -= myLr * myD1Delta[myJ]
+         for (let myI = 0; myI < COMBINED_SIZE; myI++){
+            myModel.dense1_w[myI*DENSE1_SIZE+myJ] -= myLr * myD1Delta[myJ] * myFwd.combined[myI]
+         }
+      }
+      // pool1 delta (only the flatten portion of combined-delta feeds back into conv)
+      let myPoolDelta = new Float32Array(CONV1_FLAT)
+      for (let myI = 0; myI < CONV1_FLAT; myI++){
+         let mySum = 0
+         for (let myJ = 0; myJ < DENSE1_SIZE; myJ++) mySum += myD1Delta[myJ] * myModel.dense1_w[myI*DENSE1_SIZE+myJ]
+         myPoolDelta[myI] = mySum
+      }
+      // route pool delta back through the max that won, into conv1 delta
+      let myConv1Delta = new Float32Array(CONV1_OUT_STEPS * CONV1_FILTERS)
+      for (let myS = 0; myS < POOL1_STEPS; myS++){
+         for (let myF = 0; myF < CONV1_FILTERS; myF++){
+            let myWin = myFwd.poolArgmax[myS*CONV1_FILTERS+myF]
+            let myStep = myWin === 0 ? myS*2 : myS*2+1
+            let myG = myPoolDelta[myS*CONV1_FILTERS+myF] * myLeakyReluDeriv(myFwd.conv1[myStep*CONV1_FILTERS+myF])
+            myConv1Delta[myStep*CONV1_FILTERS+myF] = myG
+         }
+      }
+      for (let myS = 0; myS < CONV1_OUT_STEPS; myS++){
+         for (let myF = 0; myF < CONV1_FILTERS; myF++){
+            let myG = myConv1Delta[myS*CONV1_FILTERS+myF]
+            if (myG === 0) continue
+            myModel.conv1_b[myF] -= myLr * myG
+            for (let myK = 0; myK < CONV1_KERNEL; myK++){
+               for (let myC = 0; myC < MY_FAST_CHANNELS; myC++){
+                  let myWIdx = (myK*MY_FAST_CHANNELS+myC)*CONV1_FILTERS+myF
+                  myModel.conv1_w[myWIdx] -= myLr * myG * myNormBuf[(myS+myK)*MY_FAST_CHANNELS+myC]
+               }
+            }
+         }
+      }
+      // cross-entropy loss for progress display
+      let myP = Math.max(myFwd.probs[myLabel], 1e-8)
+      return -Math.log(myP)
+   }
+
+   async function myTrainInBrowser(){
+      if (myDataset.length < NUM_CLASSES) {
+         myLog(`browser: need at least ${NUM_CLASSES} labeled samples (one per class) before training - got ${myDataset.length}`)
+         return
+      }
+      if (myTraining) { myLog('browser: already training'); return }
+      myTraining = true
+      if (!myModel) myInitModel()
+      myCalibrateFromDataset()
+      myLossHistory = []
+      myUpdateLossChart()
+
+      let myEpochs = parseInt(document.getElementById('myBrowserEpochs').value) || 30
+      let myLr = parseFloat(document.getElementById('myBrowserLr').value) || 0.01
+      myLog(`browser: training started - ${myDataset.length} samples, ${myEpochs} epochs, lr=${myLr}`)
+
+      for (let myEpoch = 0; myEpoch < myEpochs; myEpoch++){
+         // shuffle each epoch
+         let myOrder = myDataset.map(function(myV, myI){ return myI })
+         for (let myI = myOrder.length - 1; myI > 0; myI--){
+            let myJ = Math.floor(Math.random() * (myI + 1));
+            [myOrder[myI], myOrder[myJ]] = [myOrder[myJ], myOrder[myI]]
+         }
+         let myTotalLoss = 0
+         let myCorrect = 0
+         for (let myOI = 0; myOI < myOrder.length; myOI++){
+            let myItem = myDataset[myOrder[myOI]]
+            let myNorm = myNormalizeWindow(myItem.window)
+            myTotalLoss += myTrainStep(myNorm, myItem.label, myLr)
+            // cheap running accuracy: re-use the forward pass this step already computed indirectly
+            let myFwd = myForwardPass(myNorm)
+            let myPred = myFwd.probs.indexOf(Math.max(...myFwd.probs))
+            if (myPred === myItem.label) myCorrect++
+         }
+         let myAvgLoss = myTotalLoss / myOrder.length
+         let myAcc = myCorrect / myOrder.length
+         myLossHistory.push({ epoch: myEpoch + 1, loss: myAvgLoss, acc: myAcc })
+
+         document.getElementById('myBrowserTrainStatus').textContent =
+            `epoch ${myEpoch+1}/${myEpochs}  avg loss ${myAvgLoss.toFixed(4)}  train acc ${(myAcc*100).toFixed(0)}%`
+         myUpdateLossChart()
+         await new Promise(function(myR){ setTimeout(myR, 0) })   // yield to the UI thread every epoch, live updates
+      }
+      myTraining = false
+      myLog('browser: training complete')
+      document.getElementById('myBrowserTrainStatus').textContent += '  - DONE'
+      myModelInfo = { source: 'browser', paramCount: MY_MODEL_PACKAGE_FLOATS - 1, bytes: MY_MODEL_PACKAGE_BYTES,
+                       ts: new Date().toLocaleTimeString(), samples: myDataset.length, epochs: myEpochs }
+      myUpdateModelInfoPanel()
+   }
+
+   // [NEW v08] Live loss/accuracy chart, updated every epoch during training.
+   function myUpdateLossChart(){
+      let myX = myLossHistory.map(function(myH){ return myH.epoch })
+      let myLoss = myLossHistory.map(function(myH){ return myH.loss })
+      let myAcc = myLossHistory.map(function(myH){ return myH.acc })
+      let myTraces = [
+         { x: myX, y: myLoss, mode:'lines+markers', name:'avg loss' },
+         { x: myX, y: myAcc,  mode:'lines+markers', name:'train accuracy', yaxis:'y2' }
+      ]
+      let myLayout = {
+         title: 'Live Training Progress',
+         height: 280,
+         xaxis: { title:'epoch' },
+         yaxis: { title:'loss' },
+         yaxis2: { title:'accuracy', overlaying:'y', side:'right', range:[0,1] },
+         margin: { t:40 }
+      }
+      Plotly.react('myLossChart', myTraces, myLayout)
+   }
+
+   // ======================================================
+   // [NEW v02] LABELED DATASET CAPTURE - uses whatever window was last
+   // decoded for the chosen board (via CAPTURE or QUICK) and stashes it
+   // with the currently-selected class into the browser dataset.
+   // ======================================================
+   function myCaptureLabeledSample(){
+      let myKey = document.getElementById('myTrainSourceBoard').value
+      let myLabel = parseInt(document.getElementById('myTrainClass').value)
+      let myStatusEl = document.getElementById('myCaptureStatus')
+
+      // [CHANGED v09] This used to just grab whatever was already sitting
+      // in myLastWindow[myKey] - which only updated when you separately
+      // pressed that board's own "Capture Full Window" button, so pressing
+      // THIS button alone did nothing new (the reported bug). Now it
+      // actively triggers a fresh capture for whichever source is
+      // selected, waits for it, and labels the result that comes back.
+      if (myKey === 'phone'){
+         if (!myPhoneMotionReady){
+            myLog('phone: press "Enable Phone Motion Sensors" first')
+            if (myStatusEl){ myStatusEl.textContent = 'phone not enabled yet'; myStatusEl.style.color = 'red' }
+            return
+         }
+         if (myStatusEl){ myStatusEl.textContent = 'capturing from phone...'; myStatusEl.style.color = 'orange' }
+         myCapturePhoneMotionWindowAsync().then(function(myWindow){
+            myDataset.push({ window: myWindow.slice(), label: myLabel, source: 'phone', ts: new Date().toLocaleTimeString() })
+            myUpdateDatasetCounts()
+            myUpdateDatasetList()
+            if (myStatusEl){ myStatusEl.textContent = `added! (${myDataset.length} samples total)`; myStatusEl.style.color = 'green' }
+            myLog(`browser: captured + added phone sample for class "${MY_CLASS_LABELS[myLabel]}" - dataset now ${myDataset.length} samples`)
+         })
+         return
+      }
+
+      if (!myBoards[myKey].connected){
+         myLog(`${myKey}: not connected - connect it first, or switch "Use last reading from" to Phone`)
+         if (myStatusEl){ myStatusEl.textContent = `${myKey} not connected`; myStatusEl.style.color = 'red' }
+         return
+      }
+
+      if (myStatusEl){ myStatusEl.textContent = `waiting for ${myKey} to capture...`; myStatusEl.style.color = 'orange' }
+      myPendingLabelCapture[myKey] = { label: myLabel, statusEl: myStatusEl }
+      myWriteControl(myKey, 'CAPTURE')
+
+      // safety timeout - makes a dead/disconnected/unresponsive board
+      // visible instead of the button just silently doing nothing
+      setTimeout(function(){
+         if (myPendingLabelCapture[myKey]){
+            myLog(`${myKey}: no window arrived within 5s of CAPTURE - check that board's Serial Monitor (still connected? sensors OK?) and try again`)
+            if (myStatusEl){ myStatusEl.textContent = 'timed out - no response from board'; myStatusEl.style.color = 'red' }
+            delete myPendingLabelCapture[myKey]
+         }
+      }, 5000)
+   }
+
+   // [NEW v09] resolved (by myDecodeWindow, below) once a fresh window
+   // actually arrives from the board that myCaptureLabeledSample() just
+   // sent "CAPTURE" to - see myMaybeResolvePendingCapture().
+   let myPendingLabelCapture = {}   // { nano: {label, statusEl} } and/or { esp: {...} }
+
+   function myMaybeResolvePendingCapture(myKey){
+      let myPending = myPendingLabelCapture[myKey]
+      if (!myPending) return
+      delete myPendingLabelCapture[myKey]
+      myDataset.push({ window: myLastWindow[myKey].slice(), label: myPending.label, source: myKey, ts: new Date().toLocaleTimeString() })
+      myUpdateDatasetCounts()
+      myUpdateDatasetList()
+      if (myPending.statusEl){ myPending.statusEl.textContent = `added! (${myDataset.length} samples total)`; myPending.statusEl.style.color = 'green' }
+      myLog(`${myKey}: captured + added sample for class "${MY_CLASS_LABELS[myPending.label]}" - dataset now ${myDataset.length} samples`)
+   }
+
+   function myClearDataset(){
+      myDataset = []
+      myUpdateDatasetCounts()
+      myUpdateDatasetList()
+      myLog('browser: dataset cleared')
+   }
+
+   // ======================================================
+   // [NEW v09] EXPORT DATASET TO CSV - one row per captured sample,
+   // plain text, opens directly in Excel/Sheets/pandas etc. This is
+   // separate from the binary myFusionWeights.h/.bin model exports
+   // above: this is the raw labeled DATA (myDataset), not a trained
+   // model. Columns: label index, label name, source board/phone,
+   // timestamp, then all 407 window values with header names that
+   // spell out timestep + channel (t00_ax, t00_ay, ... t39_mic) for
+   // the 400 fast values, followed by the 7 static channel names.
+   // ======================================================
+   function myBuildDatasetCSV(){
+      let myHeader = ['label_idx', 'label_name', 'source', 'timestamp']
+      for (let myT = 0; myT < MY_IMU_TIMESTEPS; myT++){
+         for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++){
+            myHeader.push(`t${String(myT).padStart(2,'0')}_${MY_FAST_LABELS[myCh]}`)
+         }
+      }
+      MY_STATIC_LABELS.forEach(function(myLbl){ myHeader.push(myLbl) })
+      let myRows = [myHeader.join(',')]
+      myDataset.forEach(function(myItem){
+         let myRow = [myItem.label, MY_CLASS_LABELS[myItem.label], myItem.source, myItem.ts]
+         myItem.window.forEach(function(myV){ myRow.push(myV) })
+         myRows.push(myRow.join(','))
+      })
+      return myRows.join('\n') + '\n'
+   }
+
+   function mySaveDatasetCSVToDisk(){
+      if (myDataset.length === 0){ myLog('browser: dataset is empty - capture some labeled samples first'); return }
+      let myCsv = myBuildDatasetCSV()
+      let myBlob = new Blob([myCsv], { type: 'text/csv' })
+      let myUrl = URL.createObjectURL(myBlob)
+      let myA = document.createElement('a')
+      let myStamp = new Date().toISOString().replace(/[:.]/g, '-')
+      myA.href = myUrl
+      myA.download = `fusion-dataset-${myStamp}.csv`
+      document.body.appendChild(myA)
+      myA.click()
+      document.body.removeChild(myA)
+      URL.revokeObjectURL(myUrl)
+      myLog(`browser: dataset exported as ${myA.download} (${myDataset.length} samples)`)
+   }
+
+   function myUpdateDatasetCounts(){
+      let myCounts = MY_CLASS_LABELS.map(function(myLbl, myI){
+         return `${myLbl}: ${myDataset.filter(function(myD){ return myD.label === myI }).length}`
+      })
+      document.getElementById('myDatasetCounts').textContent = myCounts.join('  ')
+   }
+
+   // ======================================================
+   // [NEW v08] DATASET VIEWER - lists every captured sample individually
+   // so the "does the browser training even have real data" question is
+   // answerable at a glance, with a per-sample chart and per-sample delete.
+   // ======================================================
+   function myUpdateDatasetList(){
+      let myBody = document.getElementById('myDatasetListBody')
+      myBody.innerHTML = ''
+      myDataset.forEach(function(myItem, myIdx){
+         let myRow = document.createElement('div')
+         myRow.style = 'display:flex; align-items:center; gap:8px; padding:3px 0; border-bottom:1px solid #eee; font-size:13px;'
+         myRow.innerHTML = `<span style="width:28px;">#${myIdx}</span>` +
+            `<span style="width:90px;">${MY_CLASS_LABELS[myItem.label]}</span>` +
+            `<span style="width:60px;">${myItem.source}</span>` +
+            `<span style="width:90px;">${myItem.ts}</span>` +
+            `<input type=button value="View" onclick="myViewDatasetSample(${myIdx})">` +
+            `<input type=button value="Delete" onclick="myDeleteDatasetSample(${myIdx})">`
+         myBody.appendChild(myRow)
+      })
+      if (myDataset.length === 0){
+         myBody.innerHTML = '<i>No samples captured yet.</i>'
+      }
+   }
+
+   function myViewDatasetSample(myIdx){
+      let myItem = myDataset[myIdx]
+      if (!myItem) return
+      let myFastSize = MY_IMU_TIMESTEPS * MY_FAST_CHANNELS
+      let myLineData = []
+      for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++) myLineData.push([])
+      for (let myT = 0; myT < MY_IMU_TIMESTEPS; myT++){
+         for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++){
+            myLineData[myCh].push(myItem.window[myT * MY_FAST_CHANNELS + myCh])
+         }
+      }
+      let myTraces = myLineData.map(function(myArr, myI){
+         return { x: Array.from(Array(myArr.length).keys()), y: myArr, mode:'lines', name: MY_FAST_LABELS[myI] }
+      })
+      let myLayout = { title: `Sample #${myIdx} - class "${MY_CLASS_LABELS[myItem.label]}" (from ${myItem.source}, ${myItem.ts})`,
+                        height: 300, xaxis:{title:'timestep'}, yaxis:{title:'value'}, margin:{t:40} }
+      Plotly.newPlot('myDatasetSampleChart', myTraces, myLayout)
+      let myStaticVals = myItem.window.slice(myFastSize)
+      document.getElementById('myDatasetSampleStatic').textContent =
+         MY_STATIC_LABELS.map(function(myLbl, myI){ return `${myLbl}: ${myStaticVals[myI]}` }).join('  ')
+   }
+
+   function myDeleteDatasetSample(myIdx){
+      myDataset.splice(myIdx, 1)
+      myUpdateDatasetCounts()
+      myUpdateDatasetList()
+      myLog(`browser: deleted sample #${myIdx}`)
+   }
+
+   // ======================================================
+   // [NEW v09] TRAIN USING PHONE MOTION SENSORS (Android / iPhone browser)
+   // Lets the phone/tablet this page is open on act as a THIRD data
+   // source for the labeled dataset below, using only the phone's
+   // built-in accelerometer + gyroscope via the standard
+   // DeviceMotionEvent API - no app, no BLE, works in mobile
+   // Chrome/Safari over plain https (or localhost).
+   //
+   // Magnetometer (mx,my,mz) and mic are NOT exposed by this API on
+   // either platform, and none of the 7 "static" channels (pressure,
+   // temp, humidity, prox, colorR/G/B) exist on a phone either - all
+   // of those are simply sent as 0.0 so the captured window is still
+   // exactly PACKET_FLOATS (407) long and drops straight into the same
+   // "Capture Labeled Sample" / Train In Browser pipeline as a real
+   // board reading, with source:'phone'.
+   //
+   // Axis mapping (approximate - phone mounting orientation is
+   // arbitrary, unlike the boards' fixed IMU placement):
+   //   ax,ay,az <- accelerationIncludingGravity.x/y/z (m/s^2)
+   //   gx,gy,gz <- rotationRate.beta/gamma/alpha (deg/s)
+   //   mx,my,mz, mic <- always 0 (not available on a phone)
+   //
+   // CAVEAT: a phone's accel/gyro units, range, and mounting will not
+   // exactly match either board's IMU, so a phone-only-trained model
+   // is best treated as a quick browser demo of the gesture *shapes*
+   // themselves - re-run Step 1 calibration from the real board (and
+   // ideally mix in a few real-board samples) before relying on it for
+   // actual on-device inference on the Nano33/ESP32.
+   // ======================================================
+   let myPhoneMotionReady = false
+   let myPhoneCapturing = false
+   let myPhoneLatest = { ax:0, ay:0, az:0, gx:0, gy:0, gz:0 }
+
+   function myIsIOSMotionPermissionNeeded(){
+      return (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function')
+   }
+
+   function myOnDeviceMotion(myEvent){
+      let myAcc = myEvent.accelerationIncludingGravity || myEvent.acceleration || {}
+      let myRot = myEvent.rotationRate || {}
+      myPhoneLatest.ax = myAcc.x || 0
+      myPhoneLatest.ay = myAcc.y || 0
+      myPhoneLatest.az = myAcc.z || 0
+      myPhoneLatest.gx = myRot.beta  || 0
+      myPhoneLatest.gy = myRot.gamma || 0
+      myPhoneLatest.gz = myRot.alpha || 0
+   }
+
+   async function myEnablePhoneMotion(){
+      let myStatusEl = document.getElementById('myPhoneStatus')
+      if (typeof DeviceMotionEvent === 'undefined'){
+         myStatusEl.textContent = 'not available - this browser does not expose DeviceMotionEvent'
+         myStatusEl.style.color = 'red'
+         myLog('phone: DeviceMotionEvent is undefined - phone motion training is unavailable in this browser')
+         return
+      }
+      if (myIsIOSMotionPermissionNeeded()){
+         // iOS 13+ Safari: must be requested directly from a user tap (this button click), and only over https
+         try {
+            let myPerm = await DeviceMotionEvent.requestPermission()
+            if (myPerm !== 'granted'){
+               myStatusEl.textContent = `permission "${myPerm}" - iOS Settings > Safari > Motion & Orientation Access must be On`
+               myStatusEl.style.color = 'red'
+               myLog(`phone: motion permission "${myPerm}"`)
+               return
+            }
+         } catch (myErr) {
+            myStatusEl.textContent = `permission request failed - ${myErr}`
+            myStatusEl.style.color = 'red'
+            myLog(`phone: requestPermission() failed - ${myErr} (page must be https, and this must be a direct button tap)`)
+            return
+         }
+      }
+      window.addEventListener('devicemotion', myOnDeviceMotion)
+      myPhoneMotionReady = true
+      myStatusEl.textContent = 'enabled - move the phone, then "Capture Phone Motion Window (1s)"'
+      myStatusEl.style.color = 'green'
+      myLog('phone: devicemotion listener attached (accelerometer + gyroscope only - magnetometer/mic/static channels sent as 0)')
+   }
+
+   function myCapturePhoneMotionWindow(){
+      myCapturePhoneMotionWindowAsync()   // fire-and-forget wrapper for the standalone button - chart/status still update via the shared core below
+   }
+
+   // [NEW v09] returns a Promise<Array[407]> - shared core used by both
+   // the standalone "Capture Phone Motion Window" button AND
+   // "Capture Labeled Sample" (when Phone is the selected source), so
+   // there's exactly one place that actually samples the sensors.
+   function myCapturePhoneMotionWindowAsync(){
+      let myStatusEl = document.getElementById('myPhoneStatus')
+      return new Promise(function(myResolve, myReject){
+         if (!myPhoneMotionReady){
+            myLog('phone: press "Enable Phone Motion Sensors" first (iOS needs a tap to grant permission)')
+            myReject(new Error('phone motion not enabled'))
+            return
+         }
+         if (myPhoneCapturing){ myLog('phone: already capturing...'); myReject(new Error('already capturing')); return }
+         myPhoneCapturing = true
+         myStatusEl.textContent = 'capturing 1s window...'
+         myStatusEl.style.color = 'orange'
+         let myOut = new Array(MY_IMU_TIMESTEPS * MY_FAST_CHANNELS + MY_STATIC_LABELS.length).fill(0)
+         let myT = 0
+         let myTimer = setInterval(function(){
+            let myBase = myT * MY_FAST_CHANNELS
+            myOut[myBase + 0] = myPhoneLatest.ax
+            myOut[myBase + 1] = myPhoneLatest.ay
+            myOut[myBase + 2] = myPhoneLatest.az
+            myOut[myBase + 3] = myPhoneLatest.gx
+            myOut[myBase + 4] = myPhoneLatest.gy
+            myOut[myBase + 5] = myPhoneLatest.gz
+            // channels 6,7,8 (mx,my,mz) and 9 (mic) stay 0 - not available on a phone
+            myT++
+            if (myT >= MY_IMU_TIMESTEPS){
+               clearInterval(myTimer)
+               // all 7 static channels also stay 0 - not available on a phone
+               myLastWindow.phone = myOut
+               myPhoneCapturing = false
+               myStatusEl.textContent = `window captured (${MY_IMU_TIMESTEPS} samples)`
+               myStatusEl.style.color = 'green'
+               let myLineData = []
+               for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++) myLineData.push([])
+               for (let myTT = 0; myTT < MY_IMU_TIMESTEPS; myTT++){
+                  for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++){
+                     myLineData[myCh].push(myOut[myTT * MY_FAST_CHANNELS + myCh])
+                  }
+               }
+               let myTraces = myLineData.map(function(myArr, myI){
+                  return { x: Array.from(Array(myArr.length).keys()), y: myArr, mode:'lines', name: MY_FAST_LABELS[myI] }
+               })
+               Plotly.newPlot('myWindowChart_phone', myTraces,
+                  { title:'Phone motion window (ax..gz real, mx/my/mz/mic = 0)', height:300,
+                    xaxis:{title:'timestep'}, yaxis:{title:'value'}, margin:{t:40} })
+               myLog(`phone: captured window, ${MY_IMU_TIMESTEPS} samples over ~${MY_IMU_TIMESTEPS * MY_SAMPLE_INTERVAL_MS}ms`)
+               myResolve(myOut)
+            }
+         }, MY_SAMPLE_INTERVAL_MS)
+      })
+   }
+
+   // ======================================================
+   // [NEW v09] BROWSER-SIDE INFERENCE - runs the current "live" model
+   // (myGetCurrentModelForExport(): in-browser trained, fetched from a
+   // board, or loaded from a .bin) against whatever window is sitting
+   // in myLastWindow[myKey], entirely in JS. This is the ONLY way to
+   // get an inference result for 'phone', since a phone isn't a BLE
+   // board and has nothing to push a model to or receive a result
+   // from. For 'nano'/'esp' it's also a useful cross-check: if this
+   // gives a sane-looking prediction but the board's own on-device
+   // "Infer" button doesn't produce a result on the webpage, the
+   // problem is isolated to that board's BLE result path rather than
+   // the model or the captured data.
+   // ======================================================
+   function myRunBrowserInference(myKey){
+      let myResultEl = document.getElementById('myResult_' + myKey)
+      if (!myLastWindow[myKey]) {
+         myLog(`${myKey}: no window captured yet - press Capture first`)
+         if (myResultEl) myResultEl.textContent = 'no window captured yet'
+         return
+      }
+      let myM = myGetCurrentModelForExport()
+      if (!myM) {
+         myLog('browser: no model loaded - train in browser, fetch from a board, or load a .bin file first')
+         if (myResultEl) myResultEl.textContent = 'no model loaded'
+         return
+      }
+      let myNorm = myNormalizeWindow(myLastWindow[myKey], myM)
+      let myFwd = myForwardPass(myNorm, myM)
+      let myPred = 0
+      for (let myJ = 1; myJ < NUM_CLASSES; myJ++) if (myFwd.probs[myJ] > myFwd.probs[myPred]) myPred = myJ
+      let myOut = `${MY_CLASS_LABELS[myPred]}  (` + myFwd.probs.map(function(myP, myI){
+         return `${MY_CLASS_LABELS[myI]}=${(myP*100).toFixed(0)}%`
+      }).join(', ') + ')  [browser-side]'
+      if (myResultEl) myResultEl.textContent = myOut
+      myLog(`${myKey}: browser-side inference -> ${myOut}`)
+   }
+
+   // ======================================================
+   // [NEW v11] TOGGLE: CONTINUOUS PHONE CAPTURE + INFERENCE
+   // Answers the "irritating to press Capture then Run Inference every
+   // time" feedback - one button starts a loop that repeatedly captures
+   // a fresh 1s phone motion window and immediately runs browser
+   // inference on it, until pressed again. Each capture already takes
+   // ~1s (MY_IMU_TIMESTEPS * MY_SAMPLE_INTERVAL_MS), so this naturally
+   // runs at roughly 1 prediction/second - no separate polling interval
+   // needed, just re-arm the same capture+infer pair in a loop.
+   // ======================================================
+   let myPhoneContinuousOn = false
+
+   function myTogglePhoneContinuousInference(){
+      let myBtn = document.getElementById('myPhoneContinuousBtn')
+      if (!myPhoneContinuousOn){
+         if (!myPhoneMotionReady){
+            myLog('phone: press "Enable Phone Motion Sensors" first')
+            return
+         }
+         if (!myGetCurrentModelForExport()){
+            myLog('browser: no model loaded yet - train in browser, fetch from a board, or load a .bin file first')
+            return
+         }
+         myPhoneContinuousOn = true
+         myBtn.value = 'Stop Continuous Inference'
+         myBtn.style.backgroundColor = 'salmon'
+         myLog('phone: continuous inference ON - capturing + predicting roughly once a second until stopped')
+         myRunPhoneContinuousLoop()
+      } else {
+         myPhoneContinuousOn = false
+         myBtn.value = 'Start Continuous Inference'
+         myBtn.style.backgroundColor = 'lime'
+         myLog('phone: continuous inference OFF')
+      }
+   }
+
+   async function myRunPhoneContinuousLoop(){
+      if (!myPhoneContinuousOn) return
+      try {
+         await myCapturePhoneMotionWindowAsync()
+         myRunBrowserInference('phone')
+      } catch (myErr) {
+         // capture rejected (e.g. sensors got disabled mid-loop) - just skip this cycle and try again
+      }
+      if (myPhoneContinuousOn) setTimeout(myRunPhoneContinuousLoop, 100)
+   }
+
+   // ======================================================
+   // [NEW v02] MODEL PACKAGE PACK/UNPACK - matches PROTOCOL CONTRACT
+   // in both .ino files exactly: [numClasses, conv1_w, conv1_b,
+   // dense1_w, dense1_b, dense2_w, dense2_b, output_w, output_b,
+
+   // calibMean, calibStd]
+   // ======================================================
+   function myExportModelPackageBytes(){
+      let myBuf = new ArrayBuffer(MY_MODEL_PACKAGE_BYTES)
+      let myView = new DataView(myBuf)
+      let myOff = 0
+      function myPutFloat(myV){ myView.setFloat32(myOff, myV, true); myOff += 4 }
+      function myPutArr(myArr){ for (let myI = 0; myI < myArr.length; myI++) myPutFloat(myArr[myI]) }
+      myPutFloat(NUM_CLASSES)
+      myPutArr(myModel.conv1_w);  myPutArr(myModel.conv1_b)
+      myPutArr(myModel.dense1_w); myPutArr(myModel.dense1_b)
+      myPutArr(myModel.dense2_w); myPutArr(myModel.dense2_b)
+      myPutArr(myModel.output_w); myPutArr(myModel.output_b)
+      myPutArr(myModel.calibMean); myPutArr(myModel.calibStd)
+      return new Uint8Array(myBuf)
+   }
+
+   // Writes a model-package byte blob to a board's MODEL_CHAR, chunked
+   // with the same 4-byte-header + 180-byte-chunk pattern the firmware
+   // uses everywhere else. Works for either a browser-trained model
+   // (myExportModelPackageBytes()) or a model just relayed in from the
+   // other board (myLastReceivedModelBytes).
+   //
+   // [CHANGED v11] Pushes to the Nano33 were hanging after the very
+   // first chunk. Root cause: its ~500ms heartbeat notify could land
+   // WHILE a chunked write from here was still outstanding, which can
+   // stall that write indefinitely on some OS Bluetooth stacks - fixed
+   // on the firmware side (heartbeat now pauses during a model push,
+   // nano33-v11.ino). To make this robust from the browser side too:
+   //   - prefer writeValueWithoutResponse() (matches the characteristic's
+   //     BLEWriteWithoutResponse property, avoids waiting on a response
+   //     that a stray notify could delay)
+   //   - a small delay between chunks, giving the board's loop()/BLE.poll()
+   //     time to actually consume each one before the next arrives
+   //   - a per-chunk timeout + one retry, so a genuinely stuck write is
+   //     reported clearly instead of hanging the button forever
+   //   - periodic progress logged to the on-page log, not just the bar
+   // ======================================================
+   async function myWriteModelChunkWithRetry(myKey, myChunk, myChunkIdx, myChunkTotal){
+      let myChar = myBoards[myKey].modelChar
+      async function myAttempt(){
+         let myWritePromise = (typeof myChar.writeValueWithoutResponse === 'function')
+            ? myChar.writeValueWithoutResponse(myChunk)
+            : myChar.writeValue(myChunk)
+         let myTimeoutPromise = new Promise(function(myResolve, myReject){
+            setTimeout(function(){ myReject(new Error('chunk write timed out after 3s')) }, 3000)
+         })
+         await Promise.race([myWritePromise, myTimeoutPromise])
+      }
+      try {
+         await myAttempt()
+      } catch (myErr) {
+         myLog(`${myKey}: chunk ${myChunkIdx}/${myChunkTotal} failed (${myErr}) - retrying once...`)
+         await myAttempt()   // let this one throw up to the caller if it fails again
+      }
+   }
+
+   async function myPushModelBytesToBoard(myKey, myBytes){
+      if (!myBoards[myKey].connected || !myBoards[myKey].modelChar){
+         myLog(`${myKey}: not connected or no model characteristic available - cannot push`)
+         return
+      }
+      if (myBytes.length !== MY_MODEL_PACKAGE_BYTES){
+         myLog(`${myKey}: model push aborted - byte length ${myBytes.length} does not match expected ${MY_MODEL_PACKAGE_BYTES} (wrong architecture/class-count?)`)
+         return
+      }
+      let myBar = document.getElementById('myPushProgress')
+      myBar.max = myBytes.length; myBar.value = 0; myBar.style.display = 'inline-block'
+      try {
+         let myHeader = new Uint8Array(4)
+         let myHV = new DataView(myHeader.buffer)
+         myHV.setUint32(0, myBytes.length, true)
+         await myBoards[myKey].modelChar.writeValue(myHeader)
+         myLog(`${myKey}: model push starting, ${myBytes.length} bytes`)
+
+         const myChunkSize = 180
+         const myChunkTotal = Math.ceil(myBytes.length / myChunkSize)
+         let myChunkIdx = 0
+         let myLastLoggedPct = -1
+         for (let myOff = 0; myOff < myBytes.length; myOff += myChunkSize){
+            let myChunk = myBytes.slice(myOff, Math.min(myOff + myChunkSize, myBytes.length))
+            myChunkIdx++
+            await myWriteModelChunkWithRetry(myKey, myChunk, myChunkIdx, myChunkTotal)
+            myBar.value = myOff + myChunk.length
+            let myPct = Math.floor((myBar.value / myBytes.length) * 100)
+            if (myPct >= myLastLoggedPct + 20){
+               myLog(`${myKey}: pushing model... ${myBar.value}/${myBytes.length} bytes (${myPct}%)`)
+               myLastLoggedPct = myPct
+            }
+            await new Promise(function(myResolve){ setTimeout(myResolve, 8) })   // pace chunks so the board's loop() keeps up
+         }
+         myLog(`${myKey}: model push complete (${myBytes.length} bytes) - on the Nano33 this loads instantly; check its Serial Monitor or run "Infer" to confirm`)
+      } catch (myErr) {
+         myLog(`${myKey}: model push error - ${myErr} (if this was the Nano33 hanging after the first chunk, make sure it's running nano33-v11.ino or later)`)
+      } finally {
+         setTimeout(function(){ myBar.style.display = 'none' }, 1500)
+      }
+   }
+
+   function myPushBrowserModelToBoard(myKey){
+      if (!myModel) { myLog('browser: no trained model yet - use "Train In Browser" first'); return }
+      myPushModelBytesToBoard(myKey, myExportModelPackageBytes())
+   }
+
+   function myRelayReceivedModelToNano(){
+      if (!myLastReceivedModelBytes) { myLog('browser: no model received yet - send "Fetch ESP32 Model to Browser" first'); return }
+      myPushModelBytesToBoard('nano', myLastReceivedModelBytes)
+   }
+
+   // ======================================================
+   // [NEW v08] MODEL INFO PANEL - shows what model is currently "live"
+   // in the browser (trained here, or fetched from a board) so it's
+   // obvious what will actually be sent when you hit a push button.
+   // ======================================================
+   function myUpdateModelInfoPanel(){
+      let myEl = document.getElementById('myModelInfoText')
+      if (!myModelInfo){ myEl.textContent = 'No model loaded in the browser yet.'; return }
+      let myExtra = myModelInfo.samples ? `, trained on ${myModelInfo.samples} samples / ${myModelInfo.epochs} epochs` : ''
+      myEl.textContent = `Source: ${myModelInfo.source}  |  ${myModelInfo.paramCount.toLocaleString()} params  |  ` +
+                          `${myModelInfo.bytes.toLocaleString()} bytes  |  as of ${myModelInfo.ts}${myExtra}`
+   }
+
+   // ======================================================
+   // [NEW v08] SAVE / LOAD MODEL TO/FROM THE COMPUTER'S HARD DRIVE.
+   // Saves whichever model is currently "live" in the browser (trained
+   // here, or fetched from a board) as a raw .bin file identical in
+   // layout to what goes over BLE - so it can be reloaded later, backed
+   // up, or pushed without retraining/refetching.
+   // ======================================================
+   function myGetCurrentModelBytes(){
+      if (myModel) return myExportModelPackageBytes()
+      if (myLastReceivedModelBytes) return myLastReceivedModelBytes
+      return null
+   }
+
+   // ======================================================
+   // [NEW v09] SAVE myFusionWeights.h - ARDUINO-STYLE C++ INCLUDE FILE.
+   // Same numeric values as the .bin above, formatted as plain-text
+   // float arrays so either .ino can #include the file directly and
+   // bake the model in at compile time (no BLE push needed at boot).
+   // Array names match esp32_v08.ino's own myExportHeader() exactly
+   // (myModel_conv1_w etc), so this can replace an SD-card-exported
+   // header on the ESP32 too. Also adds myModel_calibMean/
+   // myModel_calibStd and MY_BAKED_NUM_CLASSES, which the ESP32
+   // doesn't need (it self-calibrates from the Nano33 at boot) but the
+   // Nano33 does - see the USE_BAKED_WEIGHTS block near the top of
+   // nano33-v08.ino.
+   // ======================================================
+   function myUnpackModelPackageBytes(myBytes){
+      // reverses myExportModelPackageBytes() - needed because a model
+      // "fetched from a board" or "loaded from a .bin" only exists as
+      // raw bytes in the browser, never as a named-array myModel object.
+      let myView = new DataView(myBytes.buffer, myBytes.byteOffset, myBytes.byteLength)
+      let myOff = 0
+      function myGetFloat(){ let myV = myView.getFloat32(myOff, true); myOff += 4; return myV }
+      function myGetArr(mySize){ let a = new Float32Array(mySize); for (let i = 0; i < mySize; i++) a[i] = myGetFloat(); return a }
+      myGetFloat()   // numClasses header float - already known from NUM_CLASSES, just skip past it
+      return {
+         conv1_w: myGetArr(CONV1_WEIGHTS),   conv1_b: myGetArr(CONV1_FILTERS),
+         dense1_w: myGetArr(DENSE1_WEIGHTS), dense1_b: myGetArr(DENSE1_SIZE),
+         dense2_w: myGetArr(DENSE2_WEIGHTS), dense2_b: myGetArr(DENSE2_SIZE),
+         output_w: myGetArr(OUTPUT_WEIGHTS), output_b: myGetArr(NUM_CLASSES),
+         calibMean: myGetArr(MY_FAST_CHANNELS), calibStd: myGetArr(MY_FAST_CHANNELS)
+      }
+   }
+
+   function myGetCurrentModelForExport(){
+      if (myModel) return myModel
+      if (myLastReceivedModelBytes) return myUnpackModelPackageBytes(myLastReceivedModelBytes)
+      return null
+   }
+
+   function myFormatFloatArrayC(myName, myArr){
+      let myLines = [`const float ${myName}[] = {`]
+      let myRow = []
+      for (let i = 0; i < myArr.length; i++){
+         myRow.push(myArr[i].toFixed(6) + 'f')
+         if (myRow.length === 8 || i === myArr.length - 1){
+            myLines.push('  ' + myRow.join(', ') + (i === myArr.length - 1 ? '' : ','))
+            myRow = []
+         }
+      }
+      myLines.push('};')
+      return myLines.join('\n')
+   }
+
+   function myExportWeightsHeaderText(){
+      let myM = myGetCurrentModelForExport()
+      if (!myM) return null
+      let myParts = []
+      myParts.push('#ifndef MY_FUSION_MODEL_H')
+      myParts.push('#define MY_FUSION_MODEL_H')
+      myParts.push('')
+      myParts.push('// Auto-generated by index-v08.html (myExportWeightsHeaderText)')
+      myParts.push(`// Generated: ${new Date().toISOString()}`)
+      myParts.push('// Drop this file next to either .ino as "myFusionWeights.h", then')
+      myParts.push('// uncomment "#define USE_BAKED_WEIGHTS" near the top of that sketch')
+      myParts.push('// and re-upload. Nano33: see the skeleton block near the top of')
+      myParts.push('// nano33-v08.ino. ESP32: already supported (esp32_v08.ino PART 4).')
+      myParts.push(`#define MY_BAKED_NUM_CLASSES ${NUM_CLASSES}`)
+      myParts.push('')
+      myParts.push(myFormatFloatArrayC('myModel_conv1_w', myM.conv1_w))
+      myParts.push(myFormatFloatArrayC('myModel_conv1_b', myM.conv1_b))
+      myParts.push(myFormatFloatArrayC('myModel_dense1_w', myM.dense1_w))
+      myParts.push(myFormatFloatArrayC('myModel_dense1_b', myM.dense1_b))
+      myParts.push(myFormatFloatArrayC('myModel_dense2_w', myM.dense2_w))
+      myParts.push(myFormatFloatArrayC('myModel_dense2_b', myM.dense2_b))
+      myParts.push(myFormatFloatArrayC('myModel_output_w', myM.output_w))
+      myParts.push(myFormatFloatArrayC('myModel_output_b', myM.output_b))
+      myParts.push(myFormatFloatArrayC('myModel_calibMean', myM.calibMean))
+      myParts.push(myFormatFloatArrayC('myModel_calibStd', myM.calibStd))
+      myParts.push('')
+      myParts.push('#endif // MY_FUSION_MODEL_H')
+      return myParts.join('\n') + '\n'
+   }
+
+   function mySaveWeightsHeaderToDisk(){
+      let myText = myExportWeightsHeaderText()
+      if (!myText) { myLog('browser: no model loaded yet - train in browser, fetch from a board, or load a .bin file first'); return }
+      let myBlob = new Blob([myText], { type: 'text/plain' })
+      let myUrl = URL.createObjectURL(myBlob)
+      let myA = document.createElement('a')
+      myA.href = myUrl
+      myA.download = 'myFusionWeights.h'
+      document.body.appendChild(myA)
+      myA.click()
+      document.body.removeChild(myA)
+      URL.revokeObjectURL(myUrl)
+      myLog(`browser: model saved as ${myA.download} (${myText.length.toLocaleString()} chars) - drop it next to either .ino, #define USE_BAKED_WEIGHTS, re-upload`)
+   }
+
+   function mySaveModelToDisk(){
+      let myBytes = myGetCurrentModelBytes()
+      if (!myBytes) { myLog('browser: no model loaded yet - train in browser or fetch one from a board first'); return }
+      let myBlob = new Blob([myBytes], { type: 'application/octet-stream' })
+      let myUrl = URL.createObjectURL(myBlob)
+      let myA = document.createElement('a')
+      let myStamp = new Date().toISOString().replace(/[:.]/g, '-')
+      myA.href = myUrl
+      myA.download = `fusion-model-${myStamp}.bin`
+      document.body.appendChild(myA)
+      myA.click()
+      document.body.removeChild(myA)
+      URL.revokeObjectURL(myUrl)
+      myLog(`browser: model saved to disk as ${myA.download} (${myBytes.length} bytes)`)
+   }
+
+   function myLoadModelFromDisk(myFileInputEvent){
+      let myFile = myFileInputEvent.target.files[0]
+      if (!myFile) return
+      let myReader = new FileReader()
+      myReader.onload = function(){
+         let myBytes = new Uint8Array(myReader.result)
+         if (myBytes.length !== MY_MODEL_PACKAGE_BYTES){
+            myLog(`browser: "${myFile.name}" is ${myBytes.length} bytes, expected exactly ${MY_MODEL_PACKAGE_BYTES} - not a matching model file, ignoring`)
+            return
+         }
+         myLastReceivedModelBytes = myBytes
+         myModel = null   // this file becomes the "live" model instead of any in-browser training state
+         myModelInfo = { source: `loaded from file "${myFile.name}"`, paramCount: MY_MODEL_PACKAGE_FLOATS - 1,
+                          bytes: myBytes.length, ts: new Date().toLocaleTimeString() }
+         myUpdateModelInfoPanel()
+         myLog(`browser: model loaded from "${myFile.name}" (${myBytes.length} bytes) - ready to push to either board`)
+      }
+      myReader.readAsArrayBuffer(myFile)
+      myFileInputEvent.target.value = ''   // allow re-selecting the same file later
+   }
+
+   // A loaded-from-disk / fetched-from-board model has no in-browser
+   // myModel object (only raw bytes), so pushing it needs its own path.
+   function myPushLoadedModelToBoard(myKey){
+      let myBytes = myGetCurrentModelBytes()
+      if (!myBytes) { myLog('browser: no model loaded - train in browser, fetch from a board, or load a .bin file first'); return }
+      myPushModelBytesToBoard(myKey, myBytes)
+   }
+</script>
+
+<div style="display:flex; flex-wrap:wrap; gap:30px; justify-content:center;">
+
+<!-- ================= NANO 33 BLE SENSE ================= -->
+<div style="border:2px solid gray; padding:10px; width:520px;">
+<h2>Nano 33 BLE Sense (peripheral, inference-only)</h2>
+Name prefix: <input type=text id="myPrefix_nano" value="Nano33-Fusion" size=20><br>
+<input type=button value="Connect" style="background-color:lime;" onclick="myConnectBoard('nano')">
+<input type=button value="Disconnect" onclick="myDisconnectBoard('nano')">
+Status: <span id="myStatus_nano">not connected</span><br><br>
+
+<input type=button value="Capture Full Window" style="background-color:lime;" onclick="myWriteControl('nano','CAPTURE')">
+<input type=button value="Quick Reading" onclick="myWriteControl('nano','QUICK')"><br>
+<input type=button value="Infer (on-device)" style="background-color:khaki;" onclick="myWriteControl('nano','INFER')">
+<input type=button value="Quick Infer (on-device)" style="background-color:khaki;" onclick="myWriteControl('nano','QUICKINFER')"><br>
+Custom command: <input type=text id="myCustomCmd_nano" value="" size=15>
+<input type=button value="Send" onclick="mySendCustom('nano')"><br><br>
+
+On-device result: <b><span id="myResult_nano">no model loaded yet</span></b>
+<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('nano')"><br><br>
+
+Heartbeat: <span id="myHeartText_nano">...</span>
+<div id="myHeartChart_nano" style="width:100%; height:300px;"></div>
+
+<div id="myWindowChart_nano" style="width:100%; height:300px;"></div>
+Static context: <span id="myStatic_nano">...</span>
+</div>
+
+<!-- ================= ESP32S3 ================= -->
+<div style="border:2px solid gray; padding:10px; width:520px;">
+<h2>XIAO ESP32S3 (dual role: central + peripheral)</h2>
+Name prefix: <input type=text id="myPrefix_esp" value="ESP32-Fusion" size=20><br>
+<input type=button value="Connect" style="background-color:lime;" onclick="myConnectBoard('esp')">
+<input type=button value="Disconnect" onclick="myDisconnectBoard('esp')">
+Status: <span id="myStatus_esp">not connected</span><br><br>
+
+<input type=button value="Capture Full Window" style="background-color:lime;" onclick="myWriteControl('esp','CAPTURE')">
+<input type=button value="Quick Reading" onclick="myWriteControl('esp','QUICK')"><br>
+<input type=button value="Train (on ESP32)" style="background-color:orange;" onclick="myWriteControl('esp','TRAIN')">
+<input type=button value="Infer" style="background-color:khaki;" onclick="myWriteControl('esp','INFER')">
+<input type=button value="Quick Infer" style="background-color:khaki;" onclick="myWriteControl('esp','QUICKINFER')"><br>
+<input type=button value="Push Model to Nano33" onclick="myWriteControl('esp','PUSHTONANO')">
+<input type=button value="Fetch ESP32 Model to Browser" onclick="myWriteControl('esp','PUSHMODEL')"><br>
+<input type=button value="Relay Fetched Model to Nano33" onclick="myRelayReceivedModelToNano()"><br>
+Custom command: <input type=text id="myCustomCmd_esp" value="" size=15>
+<input type=button value="Send" onclick="mySendCustom('esp')"><br><br>
+
+On-device result: <b><span id="myResult_esp">no model loaded yet</span></b>
+<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('esp')"><br><br>
+
+Heartbeat: <span id="myHeartText_esp">...</span>
+<div id="myHeartChart_esp" style="width:100%; height:300px;"></div>
+
+<div id="myWindowChart_esp" style="width:100%; height:300px;"></div>
+Static context: <span id="myStatic_esp">...</span>
+</div>
+
+<!-- ================= [NEW v09] PHONE MOTION SENSORS (no BLE, no board) ================= -->
+<div style="border:2px solid gray; padding:10px; width:520px;">
+<h2>This Phone/Tablet (motion only, no BLE)</h2>
+<p style="margin-top:0; color:#555;">Uses the browser's built-in accelerometer + gyroscope to add a
+third data source to the dataset below. No magnetometer, mic, or static sensors on a phone, so those
+channels are sent as 0. Best for quick gesture-shape demos - see the code comments for details/caveats.</p>
+<input type=button value="Enable Phone Motion Sensors" style="background-color:lime;" onclick="myEnablePhoneMotion()">
+<input type=button value="Capture Phone Motion Window (1s)" style="background-color:khaki;" onclick="myCapturePhoneMotionWindow()"><br><br>
+Status: <span id="myPhoneStatus">not enabled yet</span><br><br>
+
+On-device result: <b><span id="myResult_phone">n/a - a phone has no on-device model, this runs in the browser</span></b>
+<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('phone')"><br>
+<input type=button id="myPhoneContinuousBtn" value="Start Continuous Inference" style="background-color:lime;" onclick="myTogglePhoneContinuousInference()">
+<span style="color:#555;">- auto capture + predict, roughly once a second, until stopped</span><br><br>
+
+<div id="myWindowChart_phone" style="width:100%; height:300px;"></div>
+Static context: <span id="myStatic_phone">all 0 - phone has no barometer/temp/humidity/proximity/color sensor</span>
+</div>
+
+</div>
+
+<!-- ================= [NEW v02, overhauled v08] BROWSER-SIDE TRAINING PANEL ================= -->
+<div style="border:2px solid darkgreen; padding:10px; margin:20px auto; width:1080px;">
+<h2>Train In Browser (same architecture as both boards)</h2>
+<p>Choose a source and a class below, then hit "Capture Labeled Sample" - it now triggers a FRESH capture on
+that board (or the phone) itself and adds whatever comes back, so there's no need to separately press Capture/Quick
+on the panels above first. (Those panels' own buttons are still there if you just want to preview a reading, or to
+grab a quiet/neutral one for Step 1's calibration baseline below, without adding it to the dataset.) Once you've got
+a few samples per class, set a calibration baseline, train right here in the page, and push the result to either board.</p>
+
+<!-- ---- Step 1: calibration baseline [NEW v08] ---- -->
+<div style="background:#f5f5f0; border:1px solid #ccc; padding:8px; margin-bottom:10px;">
+<b>Step 1 - Calibration Baseline</b> (fixes the v02-v05 bug where browser-trained models didn't work on-device):<br>
+Capture one quiet/neutral reading above (board at rest / normal background), select that board below, then:
+<input type=button value="Set Calibration Baseline From Last Reading" style="background-color:khaki;" onclick="myUseLastReadingAsCalibBaseline()">
+<span id="myCalibStatus" style="color:red;">not set - training will fall back to a less accurate method and warn in the log</span>
+</div>
+
+Capture fresh sample from:
+<select id="myTrainSourceBoard">
+   <option value="nano">Nano33</option>
+   <option value="esp">ESP32</option>
+   <option value="phone">Phone (motion only)</option>
+</select>
+as class:
+<select id="myTrainClass">
+   <option value="0">0unknown</option>
+   <option value="1">1normal</option>
+   <option value="2">2issue</option>
+</select>
+<input type=button value="Capture Labeled Sample" style="background-color:lime;" onclick="myCaptureLabeledSample()">
+<span id="myCaptureStatus" style="color:#555;">idle</span><br>
+<input type=button value="Clear Dataset" onclick="myClearDataset()">
+<input type=button value="Export Dataset to CSV" style="background-color:khaki;" onclick="mySaveDatasetCSVToDisk()"><br>
+Dataset: <span id="myDatasetCounts">0unknown: 0  1normal: 0  2issue: 0</span><br>
+
+<!-- ---- Dataset viewer [NEW v08] ---- -->
+<details style="margin-top:6px;">
+<summary style="cursor:pointer;"><b>View captured samples individually</b></summary>
+<div style="display:flex; gap:20px; margin-top:6px;">
+   <div style="flex:1; min-width:320px; max-height:260px; overflow-y:auto; border:1px solid #ccc; padding:4px;">
+      <div style="display:flex; gap:8px; font-weight:bold; border-bottom:2px solid #999; padding-bottom:3px;">
+         <span style="width:28px;">#</span><span style="width:90px;">class</span>
+         <span style="width:60px;">source</span><span style="width:90px;">time</span>
+      </div>
+      <div id="myDatasetListBody"><i>No samples captured yet.</i></div>
+   </div>
+   <div style="flex:1; min-width:320px;">
+      <div id="myDatasetSampleChart" style="width:100%; height:300px;"></div>
+      <span id="myDatasetSampleStatic"></span>
+   </div>
+</div>
+</details>
+<br>
+
+<!-- ---- Step 2: train + live chart ---- -->
+<b>Step 2 - Train</b><br>
+Epochs: <input type=number id="myBrowserEpochs" value="30" size=4 style="width:60px;">
+Learning rate: <input type=number id="myBrowserLr" value="0.01" step="0.001" size=6 style="width:70px;">
+<input type=button value="Train In Browser" style="background-color:orange;" onclick="myTrainInBrowser()"><br>
+Status: <span id="myBrowserTrainStatus">not trained yet</span>
+<div id="myLossChart" style="width:100%; height:280px;"></div>
+
+<!-- ---- Step 3: model info + transfer [overhauled v08] ---- -->
+<b>Step 3 - Model Info &amp; Transfer</b><br>
+<div style="background:#f0f4f8; border:1px solid #ccc; padding:8px; margin:6px 0;">
+<span id="myModelInfoText">No model loaded in the browser yet.</span>
+</div>
+
+<input type=button value="Push Model to Nano33" style="background-color:lime;" onclick="myPushLoadedModelToBoard('nano')">
+<input type=button value="Push Model to ESP32" style="background-color:lime;" onclick="myPushLoadedModelToBoard('esp')">
+<progress id="myPushProgress" style="display:none; vertical-align:middle; width:150px;"></progress><br><br>
+
+<input type=button value="Save Model To Hard Drive (.bin)" onclick="mySaveModelToDisk()">
+Load Model From Hard Drive: <input type=file id="myModelFileInput" accept=".bin" onchange="myLoadModelFromDisk(event)"><br><br>
+<input type=button value="Save myWeights.h (Arduino Include)" style="background-color:khaki;" onclick="mySaveWeightsHeaderToDisk()">
+<span style="color:#555;">- bake the current model into either sketch at compile time (see USE_BAKED_WEIGHTS)</span>
+</div>
+
+<br>
+Log:<br>
+<textarea id="myLogArea" rows=10 cols=140></textarea><br>
+<input type=button value="Clear Log" onclick="{document.getElementById('myLogArea').value=''}">
+
+<hr>
+<p>
+Protocol notes (must match the firmware exactly):<br>
+Service UUID: 7e400001-b2c3-5d4e-af60-9b3c7d8eaf20<br>
+Control char (write): 7e400002-... - browser sends "CAPTURE", "QUICK", "TRAIN", "INFER", "QUICKINFER",
+"PUSHTONANO", or "PUSHMODEL" as plain ASCII text (Nano33 only understands CAPTURE/QUICK/INFER/QUICKINFER - it never trains)<br>
+Heartbeat char (notify, ~2Hz): 7e400003-... - CSV text "ax,ay,az,mic,temp,hum,prox"<br>
+Binary char (indicate, chunked): 7e400004-... - 4-byte little-endian uint32 length header, then raw float32LE
+payload in ~180-byte chunks. 407 floats = full 1-second window, 17 floats = QUICK reading, 5872 floats = a full
+MODEL PACKAGE (only sent by the ESP32 in response to "PUSHMODEL").<br>
+Model char (write, chunked) [NEW v02]: 7e400005-... - same 4-byte-header + chunk pattern, browser -> board,
+carries a model package (numClasses + weights + calibration) into either board's live weights.<br>
+Result char (notify) [NEW v02]: 7e400006-... - CSV text "predIdx,conf,p0,p1,...,pN-1" sent after any INFER/QUICKINFER,
+by whichever board just ran the forward pass.<br>
+myFusionWeights.h [NEW v09]: not BLE - a plain-text C++ header download (Save myWeights.h button) with the same
+numbers as the .bin, for baking a model into either sketch at compile time (USE_BAKED_WEIGHTS).<br>
+Phone motion training [NEW v09]: not BLE either - uses the browser's own DeviceMotionEvent API on the phone/tablet
+the page is open on, feeding straight into the same labeled dataset as the two boards.
+</p>
+
+By Jeremy Ellis @rocksetta<br>
+Use at your own risk!
+</body>
+</html>
