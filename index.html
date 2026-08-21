@@ -324,6 +324,7 @@ save/load model to/from a .bin file).
          let myStaticVals = myFloats.slice(myFastSize)
          myUpdateWindowChart(myKey, myLineData, 'Full window (40 timesteps)')
          myShowStatic(myKey, myStaticVals)
+         myMaybeResolvePendingCapture(myKey)   // [NEW v09] finishes a "Capture Labeled Sample" click, if one is waiting
 
       } else if (myFloatCount === (MY_FAST_CHANNELS + MY_STATIC_LABELS.length)) {
          // QUICK: single instant reading, no time axis - replicate to a
@@ -335,6 +336,7 @@ save/load model to/from a .bin file).
          let myStaticVals = myFloats.slice(MY_FAST_CHANNELS)
          myUpdateWindowChart(myKey, myLineData, 'Quick reading (single sample)')
          myShowStatic(myKey, myStaticVals)
+         myMaybeResolvePendingCapture(myKey)   // [NEW v09]
 
       } else {
          myLog(`${myKey}: got ${myFloatCount} floats, does not match a known packet shape, showing raw`)
@@ -512,12 +514,13 @@ save/load model to/from a .bin file).
       }
    }
 
-   function myNormalizeWindow(myRaw){
+   function myNormalizeWindow(myRaw, myModelObj){
+      myModelObj = myModelObj || myModel
       let myBuf = myRaw.slice()
       for (let myT = 0; myT < MY_IMU_TIMESTEPS; myT++){
          for (let myC = 0; myC < MY_FAST_CHANNELS; myC++){
             let myIdx = myT * MY_FAST_CHANNELS + myC
-            myBuf[myIdx] = myClip((myBuf[myIdx] - myModel.calibMean[myC]) / (myModel.calibStd[myC] + 1e-8), -5, 5)
+            myBuf[myIdx] = myClip((myBuf[myIdx] - myModelObj.calibMean[myC]) / (myModelObj.calibStd[myC] + 1e-8), -5, 5)
          }
       }
       let myFastSize = MY_IMU_TIMESTEPS * MY_FAST_CHANNELS
@@ -533,15 +536,20 @@ save/load model to/from a .bin file).
 
    // Forward pass, returns {conv1, pool1, combined, dense1, dense2, final, probs}
    // so backprop below can reuse every intermediate activation.
-   function myForwardPass(myNormBuf){
+   // [CHANGED v09] takes an explicit myModelObj (defaults to the global
+   // myModel used during training) so myRunBrowserInference() below can
+   // also run this against a model that was only ever loaded/fetched as
+   // raw bytes (myGetCurrentModelForExport()), never trained in this tab.
+   function myForwardPass(myNormBuf, myModelObj){
+      myModelObj = myModelObj || myModel
       let myConv1 = new Float32Array(CONV1_OUT_STEPS * CONV1_FILTERS)
       for (let myS = 0; myS < CONV1_OUT_STEPS; myS++){
          for (let myF = 0; myF < CONV1_FILTERS; myF++){
-            let mySum = myModel.conv1_b[myF]
+            let mySum = myModelObj.conv1_b[myF]
             for (let myK = 0; myK < CONV1_KERNEL; myK++){
                for (let myC = 0; myC < MY_FAST_CHANNELS; myC++){
                   mySum += myNormBuf[(myS+myK)*MY_FAST_CHANNELS+myC] *
-                           myModel.conv1_w[(myK*MY_FAST_CHANNELS+myC)*CONV1_FILTERS+myF]
+                           myModelObj.conv1_w[(myK*MY_FAST_CHANNELS+myC)*CONV1_FILTERS+myF]
                }
             }
             myConv1[myS*CONV1_FILTERS+myF] = myLeakyRelu(mySum)
@@ -564,20 +572,20 @@ save/load model to/from a .bin file).
 
       let myDense1 = new Float32Array(DENSE1_SIZE)
       for (let myJ = 0; myJ < DENSE1_SIZE; myJ++){
-         let mySum = myModel.dense1_b[myJ]
-         for (let myI = 0; myI < COMBINED_SIZE; myI++) mySum += myCombined[myI] * myModel.dense1_w[myI*DENSE1_SIZE+myJ]
+         let mySum = myModelObj.dense1_b[myJ]
+         for (let myI = 0; myI < COMBINED_SIZE; myI++) mySum += myCombined[myI] * myModelObj.dense1_w[myI*DENSE1_SIZE+myJ]
          myDense1[myJ] = myLeakyRelu(mySum)
       }
       let myDense2 = new Float32Array(DENSE2_SIZE)
       for (let myJ = 0; myJ < DENSE2_SIZE; myJ++){
-         let mySum = myModel.dense2_b[myJ]
-         for (let myI = 0; myI < DENSE1_SIZE; myI++) mySum += myDense1[myI] * myModel.dense2_w[myI*DENSE2_SIZE+myJ]
+         let mySum = myModelObj.dense2_b[myJ]
+         for (let myI = 0; myI < DENSE1_SIZE; myI++) mySum += myDense1[myI] * myModelObj.dense2_w[myI*DENSE2_SIZE+myJ]
          myDense2[myJ] = myLeakyRelu(mySum)
       }
       let myFinal = new Float32Array(NUM_CLASSES)
       for (let myJ = 0; myJ < NUM_CLASSES; myJ++){
-         let mySum = myModel.output_b[myJ]
-         for (let myI = 0; myI < DENSE2_SIZE; myI++) mySum += myDense2[myI] * myModel.output_w[myI*NUM_CLASSES+myJ]
+         let mySum = myModelObj.output_b[myJ]
+         for (let myI = 0; myI < DENSE2_SIZE; myI++) mySum += myDense2[myI] * myModelObj.output_w[myI*NUM_CLASSES+myJ]
          myFinal[myJ] = mySum
       }
       let myProbs = mySoftmax(Array.from(myFinal))
@@ -742,14 +750,66 @@ save/load model to/from a .bin file).
    function myCaptureLabeledSample(){
       let myKey = document.getElementById('myTrainSourceBoard').value
       let myLabel = parseInt(document.getElementById('myTrainClass').value)
-      if (!myLastWindow[myKey]) {
-         myLog(`browser: no window captured yet from "${myKey}" - press Capture/Quick on that panel first`)
+      let myStatusEl = document.getElementById('myCaptureStatus')
+
+      // [CHANGED v09] This used to just grab whatever was already sitting
+      // in myLastWindow[myKey] - which only updated when you separately
+      // pressed that board's own "Capture Full Window" button, so pressing
+      // THIS button alone did nothing new (the reported bug). Now it
+      // actively triggers a fresh capture for whichever source is
+      // selected, waits for it, and labels the result that comes back.
+      if (myKey === 'phone'){
+         if (!myPhoneMotionReady){
+            myLog('phone: press "Enable Phone Motion Sensors" first')
+            if (myStatusEl){ myStatusEl.textContent = 'phone not enabled yet'; myStatusEl.style.color = 'red' }
+            return
+         }
+         if (myStatusEl){ myStatusEl.textContent = 'capturing from phone...'; myStatusEl.style.color = 'orange' }
+         myCapturePhoneMotionWindowAsync().then(function(myWindow){
+            myDataset.push({ window: myWindow.slice(), label: myLabel, source: 'phone', ts: new Date().toLocaleTimeString() })
+            myUpdateDatasetCounts()
+            myUpdateDatasetList()
+            if (myStatusEl){ myStatusEl.textContent = `added! (${myDataset.length} samples total)`; myStatusEl.style.color = 'green' }
+            myLog(`browser: captured + added phone sample for class "${MY_CLASS_LABELS[myLabel]}" - dataset now ${myDataset.length} samples`)
+         })
          return
       }
-      myDataset.push({ window: myLastWindow[myKey].slice(), label: myLabel, source: myKey, ts: new Date().toLocaleTimeString() })
+
+      if (!myBoards[myKey].connected){
+         myLog(`${myKey}: not connected - connect it first, or switch "Use last reading from" to Phone`)
+         if (myStatusEl){ myStatusEl.textContent = `${myKey} not connected`; myStatusEl.style.color = 'red' }
+         return
+      }
+
+      if (myStatusEl){ myStatusEl.textContent = `waiting for ${myKey} to capture...`; myStatusEl.style.color = 'orange' }
+      myPendingLabelCapture[myKey] = { label: myLabel, statusEl: myStatusEl }
+      myWriteControl(myKey, 'CAPTURE')
+
+      // safety timeout - makes a dead/disconnected/unresponsive board
+      // visible instead of the button just silently doing nothing
+      setTimeout(function(){
+         if (myPendingLabelCapture[myKey]){
+            myLog(`${myKey}: no window arrived within 5s of CAPTURE - check that board's Serial Monitor (still connected? sensors OK?) and try again`)
+            if (myStatusEl){ myStatusEl.textContent = 'timed out - no response from board'; myStatusEl.style.color = 'red' }
+            delete myPendingLabelCapture[myKey]
+         }
+      }, 5000)
+   }
+
+   // [NEW v09] resolved (by myDecodeWindow, below) once a fresh window
+   // actually arrives from the board that myCaptureLabeledSample() just
+   // sent "CAPTURE" to - see myMaybeResolvePendingCapture().
+   let myPendingLabelCapture = {}   // { nano: {label, statusEl} } and/or { esp: {...} }
+
+   function myMaybeResolvePendingCapture(myKey){
+      let myPending = myPendingLabelCapture[myKey]
+      if (!myPending) return
+      delete myPendingLabelCapture[myKey]
+      myDataset.push({ window: myLastWindow[myKey].slice(), label: myPending.label, source: myKey, ts: new Date().toLocaleTimeString() })
       myUpdateDatasetCounts()
       myUpdateDatasetList()
-      myLog(`browser: added sample for class "${MY_CLASS_LABELS[myLabel]}" - dataset now ${myDataset.length} samples`)
+      if (myPending.statusEl){ myPending.statusEl.textContent = `added! (${myDataset.length} samples total)`; myPending.statusEl.style.color = 'green' }
+      myLog(`${myKey}: captured + added sample for class "${MY_CLASS_LABELS[myPending.label]}" - dataset now ${myDataset.length} samples`)
    }
 
    function myClearDataset(){
@@ -943,56 +1003,106 @@ save/load model to/from a .bin file).
    }
 
    function myCapturePhoneMotionWindow(){
+      myCapturePhoneMotionWindowAsync()   // fire-and-forget wrapper for the standalone button - chart/status still update via the shared core below
+   }
+
+   // [NEW v09] returns a Promise<Array[407]> - shared core used by both
+   // the standalone "Capture Phone Motion Window" button AND
+   // "Capture Labeled Sample" (when Phone is the selected source), so
+   // there's exactly one place that actually samples the sensors.
+   function myCapturePhoneMotionWindowAsync(){
       let myStatusEl = document.getElementById('myPhoneStatus')
-      if (!myPhoneMotionReady){
-         myLog('phone: press "Enable Phone Motion Sensors" first (iOS needs a tap to grant permission)')
+      return new Promise(function(myResolve, myReject){
+         if (!myPhoneMotionReady){
+            myLog('phone: press "Enable Phone Motion Sensors" first (iOS needs a tap to grant permission)')
+            myReject(new Error('phone motion not enabled'))
+            return
+         }
+         if (myPhoneCapturing){ myLog('phone: already capturing...'); myReject(new Error('already capturing')); return }
+         myPhoneCapturing = true
+         myStatusEl.textContent = 'capturing 1s window...'
+         myStatusEl.style.color = 'orange'
+         let myOut = new Array(MY_IMU_TIMESTEPS * MY_FAST_CHANNELS + MY_STATIC_LABELS.length).fill(0)
+         let myT = 0
+         let myTimer = setInterval(function(){
+            let myBase = myT * MY_FAST_CHANNELS
+            myOut[myBase + 0] = myPhoneLatest.ax
+            myOut[myBase + 1] = myPhoneLatest.ay
+            myOut[myBase + 2] = myPhoneLatest.az
+            myOut[myBase + 3] = myPhoneLatest.gx
+            myOut[myBase + 4] = myPhoneLatest.gy
+            myOut[myBase + 5] = myPhoneLatest.gz
+            // channels 6,7,8 (mx,my,mz) and 9 (mic) stay 0 - not available on a phone
+            myT++
+            if (myT >= MY_IMU_TIMESTEPS){
+               clearInterval(myTimer)
+               // all 7 static channels also stay 0 - not available on a phone
+               myLastWindow.phone = myOut
+               myPhoneCapturing = false
+               myStatusEl.textContent = `window captured (${MY_IMU_TIMESTEPS} samples)`
+               myStatusEl.style.color = 'green'
+               let myLineData = []
+               for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++) myLineData.push([])
+               for (let myTT = 0; myTT < MY_IMU_TIMESTEPS; myTT++){
+                  for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++){
+                     myLineData[myCh].push(myOut[myTT * MY_FAST_CHANNELS + myCh])
+                  }
+               }
+               let myTraces = myLineData.map(function(myArr, myI){
+                  return { x: Array.from(Array(myArr.length).keys()), y: myArr, mode:'lines', name: MY_FAST_LABELS[myI] }
+               })
+               Plotly.newPlot('myWindowChart_phone', myTraces,
+                  { title:'Phone motion window (ax..gz real, mx/my/mz/mic = 0)', height:300,
+                    xaxis:{title:'timestep'}, yaxis:{title:'value'}, margin:{t:40} })
+               myLog(`phone: captured window, ${MY_IMU_TIMESTEPS} samples over ~${MY_IMU_TIMESTEPS * MY_SAMPLE_INTERVAL_MS}ms`)
+               myResolve(myOut)
+            }
+         }, MY_SAMPLE_INTERVAL_MS)
+      })
+   }
+
+   // ======================================================
+   // [NEW v09] BROWSER-SIDE INFERENCE - runs the current "live" model
+   // (myGetCurrentModelForExport(): in-browser trained, fetched from a
+   // board, or loaded from a .bin) against whatever window is sitting
+   // in myLastWindow[myKey], entirely in JS. This is the ONLY way to
+   // get an inference result for 'phone', since a phone isn't a BLE
+   // board and has nothing to push a model to or receive a result
+   // from. For 'nano'/'esp' it's also a useful cross-check: if this
+   // gives a sane-looking prediction but the board's own on-device
+   // "Infer" button doesn't produce a result on the webpage, the
+   // problem is isolated to that board's BLE result path rather than
+   // the model or the captured data.
+   // ======================================================
+   function myRunBrowserInference(myKey){
+      let myResultEl = document.getElementById('myResult_' + myKey)
+      if (!myLastWindow[myKey]) {
+         myLog(`${myKey}: no window captured yet - press Capture first`)
+         if (myResultEl) myResultEl.textContent = 'no window captured yet'
          return
       }
-      if (myPhoneCapturing){ myLog('phone: already capturing...'); return }
-      myPhoneCapturing = true
-      myStatusEl.textContent = 'capturing 1s window...'
-      myStatusEl.style.color = 'orange'
-      let myOut = new Array(MY_IMU_TIMESTEPS * MY_FAST_CHANNELS + MY_STATIC_LABELS.length).fill(0)
-      let myT = 0
-      let myTimer = setInterval(function(){
-         let myBase = myT * MY_FAST_CHANNELS
-         myOut[myBase + 0] = myPhoneLatest.ax
-         myOut[myBase + 1] = myPhoneLatest.ay
-         myOut[myBase + 2] = myPhoneLatest.az
-         myOut[myBase + 3] = myPhoneLatest.gx
-         myOut[myBase + 4] = myPhoneLatest.gy
-         myOut[myBase + 5] = myPhoneLatest.gz
-         // channels 6,7,8 (mx,my,mz) and 9 (mic) stay 0 - not available on a phone
-         myT++
-         if (myT >= MY_IMU_TIMESTEPS){
-            clearInterval(myTimer)
-            // all 7 static channels also stay 0 - not available on a phone
-            myLastWindow.phone = myOut
-            myPhoneCapturing = false
-            myStatusEl.textContent = `window captured (${MY_IMU_TIMESTEPS} samples) - select "Phone" below and label it`
-            myStatusEl.style.color = 'green'
-            let myLineData = []
-            for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++) myLineData.push([])
-            for (let myTT = 0; myTT < MY_IMU_TIMESTEPS; myTT++){
-               for (let myCh = 0; myCh < MY_FAST_CHANNELS; myCh++){
-                  myLineData[myCh].push(myOut[myTT * MY_FAST_CHANNELS + myCh])
-               }
-            }
-            let myTraces = myLineData.map(function(myArr, myI){
-               return { x: Array.from(Array(myArr.length).keys()), y: myArr, mode:'lines', name: MY_FAST_LABELS[myI] }
-            })
-            Plotly.newPlot('myWindowChart_phone', myTraces,
-               { title:'Phone motion window (ax..gz real, mx/my/mz/mic = 0)', height:300,
-                 xaxis:{title:'timestep'}, yaxis:{title:'value'}, margin:{t:40} })
-            myLog(`phone: captured window, ${MY_IMU_TIMESTEPS} samples over ~${MY_IMU_TIMESTEPS * MY_SAMPLE_INTERVAL_MS}ms`)
-         }
-      }, MY_SAMPLE_INTERVAL_MS)
+      let myM = myGetCurrentModelForExport()
+      if (!myM) {
+         myLog('browser: no model loaded - train in browser, fetch from a board, or load a .bin file first')
+         if (myResultEl) myResultEl.textContent = 'no model loaded'
+         return
+      }
+      let myNorm = myNormalizeWindow(myLastWindow[myKey], myM)
+      let myFwd = myForwardPass(myNorm, myM)
+      let myPred = 0
+      for (let myJ = 1; myJ < NUM_CLASSES; myJ++) if (myFwd.probs[myJ] > myFwd.probs[myPred]) myPred = myJ
+      let myOut = `${MY_CLASS_LABELS[myPred]}  (` + myFwd.probs.map(function(myP, myI){
+         return `${MY_CLASS_LABELS[myI]}=${(myP*100).toFixed(0)}%`
+      }).join(', ') + ')  [browser-side]'
+      if (myResultEl) myResultEl.textContent = myOut
+      myLog(`${myKey}: browser-side inference -> ${myOut}`)
    }
 
    // ======================================================
    // [NEW v02] MODEL PACKAGE PACK/UNPACK - matches PROTOCOL CONTRACT
    // in both .ino files exactly: [numClasses, conv1_w, conv1_b,
    // dense1_w, dense1_b, dense2_w, dense2_b, output_w, output_b,
+
    // calibMean, calibStd]
    // ======================================================
    function myExportModelPackageBytes(){
@@ -1242,7 +1352,8 @@ Status: <span id="myStatus_nano">not connected</span><br><br>
 Custom command: <input type=text id="myCustomCmd_nano" value="" size=15>
 <input type=button value="Send" onclick="mySendCustom('nano')"><br><br>
 
-On-device result: <b><span id="myResult_nano">no model loaded yet</span></b><br><br>
+On-device result: <b><span id="myResult_nano">no model loaded yet</span></b>
+<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('nano')"><br><br>
 
 Heartbeat: <span id="myHeartText_nano">...</span>
 <div id="myHeartChart_nano" style="width:100%; height:300px;"></div>
@@ -1270,7 +1381,8 @@ Status: <span id="myStatus_esp">not connected</span><br><br>
 Custom command: <input type=text id="myCustomCmd_esp" value="" size=15>
 <input type=button value="Send" onclick="mySendCustom('esp')"><br><br>
 
-On-device result: <b><span id="myResult_esp">no model loaded yet</span></b><br><br>
+On-device result: <b><span id="myResult_esp">no model loaded yet</span></b>
+<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('esp')"><br><br>
 
 Heartbeat: <span id="myHeartText_esp">...</span>
 <div id="myHeartChart_esp" style="width:100%; height:300px;"></div>
@@ -1289,6 +1401,9 @@ channels are sent as 0. Best for quick gesture-shape demos - see the code commen
 <input type=button value="Capture Phone Motion Window (1s)" style="background-color:khaki;" onclick="myCapturePhoneMotionWindow()"><br><br>
 Status: <span id="myPhoneStatus">not enabled yet</span><br><br>
 
+On-device result: <b><span id="myResult_phone">n/a - a phone has no on-device model, this runs in the browser</span></b>
+<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('phone')"><br><br>
+
 <div id="myWindowChart_phone" style="width:100%; height:300px;"></div>
 Static context: <span id="myStatic_phone">all 0 - phone has no barometer/temp/humidity/proximity/color sensor</span>
 </div>
@@ -1298,9 +1413,11 @@ Static context: <span id="myStatic_phone">all 0 - phone has no barometer/temp/hu
 <!-- ================= [NEW v02, overhauled v08] BROWSER-SIDE TRAINING PANEL ================= -->
 <div style="border:2px solid darkgreen; padding:10px; margin:20px auto; width:1080px;">
 <h2>Train In Browser (same architecture as both boards)</h2>
-<p>Press Capture/Quick on either panel above first, choose which board's last reading to use and which class it
-represents, then "Capture Labeled Sample" to add it to the dataset below. Once you've got a few samples per
-class, set a calibration baseline, train right here in the page, and push the result to either board.</p>
+<p>Choose a source and a class below, then hit "Capture Labeled Sample" - it now triggers a FRESH capture on
+that board (or the phone) itself and adds whatever comes back, so there's no need to separately press Capture/Quick
+on the panels above first. (Those panels' own buttons are still there if you just want to preview a reading, or to
+grab a quiet/neutral one for Step 1's calibration baseline below, without adding it to the dataset.) Once you've got
+a few samples per class, set a calibration baseline, train right here in the page, and push the result to either board.</p>
 
 <!-- ---- Step 1: calibration baseline [NEW v08] ---- -->
 <div style="background:#f5f5f0; border:1px solid #ccc; padding:8px; margin-bottom:10px;">
@@ -1310,7 +1427,7 @@ Capture one quiet/neutral reading above (board at rest / normal background), sel
 <span id="myCalibStatus" style="color:red;">not set - training will fall back to a less accurate method and warn in the log</span>
 </div>
 
-Use last reading from:
+Capture fresh sample from:
 <select id="myTrainSourceBoard">
    <option value="nano">Nano33</option>
    <option value="esp">ESP32</option>
@@ -1323,6 +1440,7 @@ as class:
    <option value="2">2issue</option>
 </select>
 <input type=button value="Capture Labeled Sample" style="background-color:lime;" onclick="myCaptureLabeledSample()">
+<span id="myCaptureStatus" style="color:#555;">idle</span><br>
 <input type=button value="Clear Dataset" onclick="myClearDataset()">
 <input type=button value="Export Dataset to CSV" style="background-color:khaki;" onclick="mySaveDatasetCSVToDisk()"><br>
 Dataset: <span id="myDatasetCounts">0unknown: 0  1normal: 0  2issue: 0</span><br>
