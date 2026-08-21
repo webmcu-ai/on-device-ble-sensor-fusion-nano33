@@ -3,12 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WebBLE Dual Board Control - Nano33 + ESP32S3 - v10</title>
+<title>WebBLE Dual Board Control - Nano33 + ESP32S3 - v11</title>
 <script src="https://cdn.plot.ly/plotly-1.47.4.min.js"></script>
 </head>
 <body>
 
-<h1 align=center>WebBLE Dual Board Control - v10</h1>
+<h1 align=center>WebBLE Dual Board Control - v11</h1>
 <h3 align=center>Nano 33 BLE Sense (peripheral, inference-only) + XIAO ESP32S3 (dual role: central to Nano33, peripheral to this page)</h3>
 <h6>Uses Web Bluetooth directly for the boards - Chrome or Edge on Windows/Mac/Linux/ChromeOS/Android only. Phone
 motion training below uses a separate, plain-web-standards API (DeviceMotionEvent) that also works in mobile Safari.</h6>
@@ -20,24 +20,25 @@ it only ever receives a finished model (from the ESP32, from this page, or baked
 inference locally, reporting results back over BLE. Quick and full inference both work everywhere.
 </p>
 <p>
-<b>What's new in v09 (webpage only - esp32 firmware unchanged, nano33 firmware gets a new optional baked-weights block):</b>
+<b>What's new in v11 - requires nano33-v11.ino (esp32 firmware still untouched):</b>
 </p>
 <ul>
-<li><b>Save myFusionWeights.h (Arduino include)</b> - alongside the existing .bin download, a new button exports
-the current model as a plain-text C++ header (same array names/format as the ESP32's own SD-card header export)
-that either sketch can <code>#include</code> directly to bake a model in at compile time via
-<code>#define USE_BAKED_WEIGHTS</code> - no BLE push needed at boot. The Nano33 sketch now has a matching skeleton
-block near its top so it knows how to consume one.</li>
-<li><b>Train using your phone's motion sensors.</b> A third panel next to the Nano33/ESP32 boxes lets an Android
-or iPhone browser add labeled samples using only its built-in accelerometer + gyroscope (DeviceMotionEvent) -
-no BLE, no board needed. Magnetometer, mic, and all 7 "static" channels aren't available on a phone, so those
-are sent as 0; see the in-code comments for the axis mapping and caveats about mixing phone- and board-trained data.</li>
+<li><b>Fixed model push hanging on the Nano33 after the first chunk.</b> Its ~500ms heartbeat notify could land
+while a chunked model write from this page was still in flight, which can stall a Web Bluetooth write indefinitely
+on some OS Bluetooth stacks - exactly the "Model RX: 180/23488 bytes (0%)" then nothing symptom. The Nano33 now
+pauses its heartbeat for the duration of a model push (and has a 5s stale-transfer watchdog so a stuck push can't
+permanently block the next attempt). The push button here now also paces chunks, retries a single failed chunk
+once, and logs progress to the log box below (not just the progress bar) so a real hang is easy to spot.</li>
+<li><b>Phone: Start/Stop Continuous Inference.</b> A new toggle button on the phone panel repeatedly captures a
+fresh 1s motion window and runs browser inference on it automatically (~1x/second) until you press it again -
+no more manually pressing Capture then Run Browser Inference for every reading.</li>
 </ul>
 <p>
-<b>What was new in v08:</b> fixed a calibration bug that broke browser-trained models (now uses an explicit
-"Set Calibration Baseline" step matching the firmware exactly), a live per-epoch training chart, a dataset
-viewer (view/delete individual samples), and the model-transfer panel overhaul (info panel, progress bar,
-save/load model to/from a .bin file).
+<b>What was new in v09:</b> "Save myFusionWeights.h" button to bake a model into either sketch at compile time
+(<code>USE_BAKED_WEIGHTS</code>), phone-motion training via DeviceMotionEvent, "Capture Labeled Sample" now
+actively triggers a fresh capture on whichever source is selected instead of relabeling a stale reading, and a
+"Run Browser Inference" button on every panel (the only way to get a prediction for phone data, and a useful
+cross-check for the boards' on-device BLE result path).
 </p>
 
 <script>
@@ -1099,6 +1100,53 @@ save/load model to/from a .bin file).
    }
 
    // ======================================================
+   // [NEW v11] TOGGLE: CONTINUOUS PHONE CAPTURE + INFERENCE
+   // Answers the "irritating to press Capture then Run Inference every
+   // time" feedback - one button starts a loop that repeatedly captures
+   // a fresh 1s phone motion window and immediately runs browser
+   // inference on it, until pressed again. Each capture already takes
+   // ~1s (MY_IMU_TIMESTEPS * MY_SAMPLE_INTERVAL_MS), so this naturally
+   // runs at roughly 1 prediction/second - no separate polling interval
+   // needed, just re-arm the same capture+infer pair in a loop.
+   // ======================================================
+   let myPhoneContinuousOn = false
+
+   function myTogglePhoneContinuousInference(){
+      let myBtn = document.getElementById('myPhoneContinuousBtn')
+      if (!myPhoneContinuousOn){
+         if (!myPhoneMotionReady){
+            myLog('phone: press "Enable Phone Motion Sensors" first')
+            return
+         }
+         if (!myGetCurrentModelForExport()){
+            myLog('browser: no model loaded yet - train in browser, fetch from a board, or load a .bin file first')
+            return
+         }
+         myPhoneContinuousOn = true
+         myBtn.value = 'Stop Continuous Inference'
+         myBtn.style.backgroundColor = 'salmon'
+         myLog('phone: continuous inference ON - capturing + predicting roughly once a second until stopped')
+         myRunPhoneContinuousLoop()
+      } else {
+         myPhoneContinuousOn = false
+         myBtn.value = 'Start Continuous Inference'
+         myBtn.style.backgroundColor = 'lime'
+         myLog('phone: continuous inference OFF')
+      }
+   }
+
+   async function myRunPhoneContinuousLoop(){
+      if (!myPhoneContinuousOn) return
+      try {
+         await myCapturePhoneMotionWindowAsync()
+         myRunBrowserInference('phone')
+      } catch (myErr) {
+         // capture rejected (e.g. sensors got disabled mid-loop) - just skip this cycle and try again
+      }
+      if (myPhoneContinuousOn) setTimeout(myRunPhoneContinuousLoop, 100)
+   }
+
+   // ======================================================
    // [NEW v02] MODEL PACKAGE PACK/UNPACK - matches PROTOCOL CONTRACT
    // in both .ino files exactly: [numClasses, conv1_w, conv1_b,
    // dense1_w, dense1_b, dense2_w, dense2_b, output_w, output_b,
@@ -1125,6 +1173,41 @@ save/load model to/from a .bin file).
    // uses everywhere else. Works for either a browser-trained model
    // (myExportModelPackageBytes()) or a model just relayed in from the
    // other board (myLastReceivedModelBytes).
+   //
+   // [CHANGED v11] Pushes to the Nano33 were hanging after the very
+   // first chunk. Root cause: its ~500ms heartbeat notify could land
+   // WHILE a chunked write from here was still outstanding, which can
+   // stall that write indefinitely on some OS Bluetooth stacks - fixed
+   // on the firmware side (heartbeat now pauses during a model push,
+   // nano33-v11.ino). To make this robust from the browser side too:
+   //   - prefer writeValueWithoutResponse() (matches the characteristic's
+   //     BLEWriteWithoutResponse property, avoids waiting on a response
+   //     that a stray notify could delay)
+   //   - a small delay between chunks, giving the board's loop()/BLE.poll()
+   //     time to actually consume each one before the next arrives
+   //   - a per-chunk timeout + one retry, so a genuinely stuck write is
+   //     reported clearly instead of hanging the button forever
+   //   - periodic progress logged to the on-page log, not just the bar
+   // ======================================================
+   async function myWriteModelChunkWithRetry(myKey, myChunk, myChunkIdx, myChunkTotal){
+      let myChar = myBoards[myKey].modelChar
+      async function myAttempt(){
+         let myWritePromise = (typeof myChar.writeValueWithoutResponse === 'function')
+            ? myChar.writeValueWithoutResponse(myChunk)
+            : myChar.writeValue(myChunk)
+         let myTimeoutPromise = new Promise(function(myResolve, myReject){
+            setTimeout(function(){ myReject(new Error('chunk write timed out after 3s')) }, 3000)
+         })
+         await Promise.race([myWritePromise, myTimeoutPromise])
+      }
+      try {
+         await myAttempt()
+      } catch (myErr) {
+         myLog(`${myKey}: chunk ${myChunkIdx}/${myChunkTotal} failed (${myErr}) - retrying once...`)
+         await myAttempt()   // let this one throw up to the caller if it fails again
+      }
+   }
+
    async function myPushModelBytesToBoard(myKey, myBytes){
       if (!myBoards[myKey].connected || !myBoards[myKey].modelChar){
          myLog(`${myKey}: not connected or no model characteristic available - cannot push`)
@@ -1144,14 +1227,24 @@ save/load model to/from a .bin file).
          myLog(`${myKey}: model push starting, ${myBytes.length} bytes`)
 
          const myChunkSize = 180
+         const myChunkTotal = Math.ceil(myBytes.length / myChunkSize)
+         let myChunkIdx = 0
+         let myLastLoggedPct = -1
          for (let myOff = 0; myOff < myBytes.length; myOff += myChunkSize){
             let myChunk = myBytes.slice(myOff, Math.min(myOff + myChunkSize, myBytes.length))
-            await myBoards[myKey].modelChar.writeValue(myChunk)
+            myChunkIdx++
+            await myWriteModelChunkWithRetry(myKey, myChunk, myChunkIdx, myChunkTotal)
             myBar.value = myOff + myChunk.length
+            let myPct = Math.floor((myBar.value / myBytes.length) * 100)
+            if (myPct >= myLastLoggedPct + 20){
+               myLog(`${myKey}: pushing model... ${myBar.value}/${myBytes.length} bytes (${myPct}%)`)
+               myLastLoggedPct = myPct
+            }
+            await new Promise(function(myResolve){ setTimeout(myResolve, 8) })   // pace chunks so the board's loop() keeps up
          }
          myLog(`${myKey}: model push complete (${myBytes.length} bytes) - on the Nano33 this loads instantly; check its Serial Monitor or run "Infer" to confirm`)
       } catch (myErr) {
-         myLog(`${myKey}: model push error - ${myErr}`)
+         myLog(`${myKey}: model push error - ${myErr} (if this was the Nano33 hanging after the first chunk, make sure it's running nano33-v11.ino or later)`)
       } finally {
          setTimeout(function(){ myBar.style.display = 'none' }, 1500)
       }
@@ -1402,7 +1495,9 @@ channels are sent as 0. Best for quick gesture-shape demos - see the code commen
 Status: <span id="myPhoneStatus">not enabled yet</span><br><br>
 
 On-device result: <b><span id="myResult_phone">n/a - a phone has no on-device model, this runs in the browser</span></b>
-<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('phone')"><br><br>
+<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('phone')"><br>
+<input type=button id="myPhoneContinuousBtn" value="Start Continuous Inference" style="background-color:lime;" onclick="myTogglePhoneContinuousInference()">
+<span style="color:#555;">- auto capture + predict, roughly once a second, until stopped</span><br><br>
 
 <div id="myWindowChart_phone" style="width:100%; height:300px;"></div>
 Static context: <span id="myStatic_phone">all 0 - phone has no barometer/temp/humidity/proximity/color sensor</span>
