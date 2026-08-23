@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WebBLE Dual Board Control - Nano33 + ESP32S3 - v11</title>
+<title>WebBLE Dual Board Control - Nano33 + ESP32S3 - v14</title>
 <script src="https://cdn.plot.ly/plotly-1.47.4.min.js"></script>
 </head>
 <body>
 
-<h1 align=center>WebBLE Dual Board Control - v11</h1>
+<h1 align=center>WebBLE Dual Board Control - v14</h1>
 <h3 align=center>Nano 33 BLE Sense (peripheral, inference-only) + XIAO ESP32S3 (dual role: central to Nano33, peripheral to this page)</h3>
-<h6>Uses Web Bluetooth directly for the boards - Chrome or Edge on Windows/Mac/Linux/ChromeOS/Android only. Phone
+<h6>Uses Web Bluetooth directly for the boards - Chrome or Edge on Windows/Mac/Linux/ChromeOS/Android only. Phonae
 motion training below uses a separate, plain-web-standards API (DeviceMotionEvent) that also works in mobile Safari.</h6>
 
 <p>
@@ -20,25 +20,81 @@ it only ever receives a finished model (from the ESP32, from this page, or baked
 inference locally, reporting results back over BLE. Quick and full inference both work everywhere.
 </p>
 <p>
-<b>What's new in v11 - requires nano33-v11.ino (esp32 firmware still untouched):</b>
+<b>What's new in v14.2:</b>
 </p>
 <ul>
-<li><b>Fixed model push hanging on the Nano33 after the first chunk.</b> Its ~500ms heartbeat notify could land
-while a chunked model write from this page was still in flight, which can stall a Web Bluetooth write indefinitely
-on some OS Bluetooth stacks - exactly the "Model RX: 180/23488 bytes (0%)" then nothing symptom. The Nano33 now
-pauses its heartbeat for the duration of a model push (and has a 5s stale-transfer watchdog so a stuck push can't
-permanently block the next attempt). The push button here now also paces chunks, retries a single failed chunk
-once, and logs progress to the log box below (not just the progress bar) so a real hang is easy to spot.</li>
-<li><b>Phone: Start/Stop Continuous Inference.</b> A new toggle button on the phone panel repeatedly captures a
-fresh 1s motion window and runs browser inference on it automatically (~1x/second) until you press it again -
-no more manually pressing Capture then Run Browser Inference for every reading.</li>
+<li><b>"Fetch ESP32 Model to Browser" - round 3, real fix.</b> v14.1's much more patient retry loop still
+stalled at the EXACT same byte count (2968) as before, byte-for-byte, on a second run with different retry
+timing - which rules out ordinary congestion (that would vary run to run) and points at a hard limit specific
+to BLE's confirmed INDICATE mechanism rather than something more retrying could fix. This matches a known class
+of Web Bluetooth / OS Bluetooth stack limitation with sustained indicated transfers. The ESP32's outbound binary
+channel is switched from INDICATE to NOTIFY (unconfirmed) - it no longer depends on an OS-level confirmation
+channel that had demonstrated it doesn't reliably complete for this data volume.</li>
+<li><b>New BLE-free fallback: "Paste Model From Serial".</b> In case NOTIFY still isn't fully reliable on some
+machine/browser/OS combination, the ESP32 got a new <code>e</code> Serial command that dumps its trained model as
+plain hex text over USB Serial. Copy it out of the Serial Monitor and paste it into the new box under the ESP32's
+panel - this goes over USB + clipboard, not BLE, so it's immune to any BLE-side limitation entirely. Same
+underlying idea as the existing "Save myWeights.h" download, applied to a live model load instead of a
+compile-time bake-in.</li>
 </ul>
 <p>
-<b>What was new in v09:</b> "Save myFusionWeights.h" button to bake a model into either sketch at compile time
-(<code>USE_BAKED_WEIGHTS</code>), phone-motion training via DeviceMotionEvent, "Capture Labeled Sample" now
-actively triggers a fresh capture on whichever source is selected instead of relabeling a stale reading, and a
-"Run Browser Inference" button on every panel (the only way to get a prediction for phone data, and a useful
-cross-check for the boards' on-device BLE result path).
+<b>What's new in v14.1:</b>
+</p>
+<ul>
+<li><b>Fixed the webpage misreading on-device inference results.</b> Both boards send
+<code>predIdx,conf,p0,p1,...,pN-1</code> - predicted index, then a deliberate duplicate of that class's own
+confidence, then the full per-class array. The page was only skipping the first field, so the duplicate "conf"
+value got mistaken for class 0's probability and every real value shifted one slot late - the classic symptom
+was two classes both showing near 100%, even though each board's own Serial Monitor (which never goes through
+this parsing) was correct the whole time. Now skips both fields correctly.</li>
+<li><b>"Fetch ESP32 Model to Browser" - round 2 (superseded by v14.2 above).</b> v14's fix still stalled
+partway through the ~131-chunk model transfer in real testing. A single 30ms retry didn't give the BLE stack
+close to enough time to recover, so <code>myServerSendBinary()</code> was changed to retry a stuck chunk in a
+bounded loop (up to 3 seconds) instead of giving up almost immediately. Turned out to help but not fully solve
+it - see v14.2.</li>
+</ul>
+<p>
+<b>What's new in v14 - requires nano33-v14.ino AND esp32-v14.ino:</b>
+</p>
+<ul>
+<li><b>Consistent "On-device result" text everywhere.</b> The Nano33 and ESP32 used to print different Serial
+Monitor formats for full vs quick inference (and neither board matched the other). Both boards now build the
+result line through one shared function each, and this page's on-screen text uses the identical format:
+<code>On-device result: 1normal (0unknown=3%, 1normal=90%, 2issue=7%,)</code></li>
+<li><b>Nano33 got a 'd' debug-toggle Serial menu item</b>, matching the ESP32's - it had none before, so its
+per-timestep sampling debug lines were always on with no way to quiet them.</li>
+<li><b>"Fetch ESP32 Model to Browser" - first attempt.</b> v13's fix (a blind pacing delay between BLE
+indicate() calls) reduced but didn't eliminate dropped chunks on the ~131-chunk model transfer, because a delay
+alone never confirms anything actually arrived. <code>myServerSendBinary()</code> now checks each indicate()'s own
+return value instead of just hoping (superseded by the more patient retry logic in v14.1 above).</li>
+<li><b>The webpage no longer gets permanently stuck after one failed/stalled transfer.</b> A binary transfer that
+stalls partway (e.g. the bug above, before it was fixed, or any other dropped packet) used to leave the browser's
+receive state stuck forever, silently corrupting every Capture/Quick/Fetch for that board afterwards until the
+page was reloaded. A stale-transfer watchdog now resets it automatically and logs why.</li>
+<li><b>"Run Browser Inference" relabeled and given a tooltip</b> explaining what it actually does: runs the
+CURRENT browser model against the LAST CAPTURED window, entirely in JavaScript, no BLE involved - handy as a
+cross-check when a board's own on-device result isn't showing up.</li>
+<li><b>Added a Serial Monitor command reference</b> (further down this page, in the Protocol notes section) -
+previously this page only documented the BLE wire protocol, never each board's own USB-Serial menu keys.</li>
+</ul>
+<p>
+<b>What was new in v13:</b>
+</p>
+<ul>
+<li><b>Fixed a Nano33 compile error some sketch edits could trigger</b> ("used before declared") - a couple of
+global variables got referenced (in the v11/v12 model-push fixes) above the point in the file where they were
+declared. Arduino's build step only auto-forward-declares <i>functions</i>, never variables, so a global has to
+physically sit above every place that uses it. Moved the affected globals up next to the model-receive state
+they're tied to, so this class of ordering bug is much less likely to resurface as the file keeps growing.</li>
+<li><b>Attempted a fix for "Fetch ESP32 Model to Browser" not completing</b> (superseded by the real fix in v14
+above) - added a pacing delay between indicate() calls, which helped but didn't fully solve it.</li>
+<li><b>Nano33 graphs can now be shown/hidden.</b> A "Show graphs" checkbox next to the Nano33's heartbeat label
+toggles both its charts off and on.</li>
+</ul>
+<p>
+<b>What was new in v12:</b> model pushes to the Nano33 switched from write-without-response to write-with-response
+(the browser now waits for each chunk's acknowledgement before sending the next, instead of flooding faster than
+the board could keep up), plus other commands to a board are held off while a push to it is in flight.
 </p>
 
 <script>
@@ -98,12 +154,12 @@ cross-check for the boards' on-device BLE result path).
    let myBoards = {
       nano: { device:null, server:null, service:null, controlChar:null, heartbeatChar:null, binaryChar:null,
               modelChar:null, resultChar:null,
-              connected:false, receiving:false, expectedBytes:0, receivedBytes:0, chunks:[],
-              heartT:0, heart:{ax:[],ay:[],az:[],mic:[],temp:[],hum:[],prox:[]} },
+              connected:false, receiving:false, expectedBytes:0, receivedBytes:0, chunks:[], lastChunkMs:0,
+              heartT:0, heart:{ax:[],ay:[],az:[],mic:[],temp:[],hum:[],prox:[]}, pushInProgress:false },
       esp:  { device:null, server:null, service:null, controlChar:null, heartbeatChar:null, binaryChar:null,
               modelChar:null, resultChar:null,
-              connected:false, receiving:false, expectedBytes:0, receivedBytes:0, chunks:[],
-              heartT:0, heart:{ax:[],ay:[],az:[],mic:[],temp:[],hum:[],prox:[]} }
+              connected:false, receiving:false, expectedBytes:0, receivedBytes:0, chunks:[], lastChunkMs:0,
+              heartT:0, heart:{ax:[],ay:[],az:[],mic:[],temp:[],hum:[],prox:[]}, pushInProgress:false }   // [NEW v12] pushInProgress on both
    }
 
    // Most-recently-decoded raw window per board (407 or 17 floats),
@@ -199,6 +255,13 @@ cross-check for the boards' on-device BLE result path).
          myLog(`${myKey}: not connected, cannot send "${myCmd}"`)
          return
       }
+      // [NEW v12] don't let anything else (capture, infer, another push...)
+      // interleave with an in-flight model push on the same connection -
+      // that kind of overlap was a plausible extra way to stall the link.
+      if (myBoards[myKey].pushInProgress){
+         myLog(`${myKey}: model push in progress - "${myCmd}" ignored until it finishes`)
+         return
+      }
       try {
          let myEncoder = new TextEncoder()
          await myBoards[myKey].controlChar.writeValue(myEncoder.encode(myCmd))
@@ -266,6 +329,7 @@ cross-check for the boards' on-device BLE result path).
    function myHandleBinary(myKey, myEvent){
       let myB = myBoards[myKey]
       let myValue = myEvent.target.value   // DataView
+      myB.lastChunkMs = Date.now()   // [NEW v14] feeds the stale-transfer watchdog below
 
       if (!myB.receiving){
          if (myValue.byteLength === 4){
@@ -292,15 +356,98 @@ cross-check for the boards' on-device BLE result path).
          myLog(`${myKey}: binary transfer complete, ${myB.receivedBytes} bytes`)
 
          if (myB.receivedBytes === MY_MODEL_PACKAGE_BYTES) {
-            myLastReceivedModelBytes = myFull   // [NEW v02] stash so "Push to Nano33" can relay it verbatim
-            myModelInfo = { source: `fetched from ${myKey}`, paramCount: MY_MODEL_PACKAGE_FLOATS - 1,
-                             bytes: MY_MODEL_PACKAGE_BYTES, ts: new Date().toLocaleTimeString() }
-            myUpdateModelInfoPanel()
-            myLog(`${myKey}: that was a MODEL PACKAGE, not a sensor window - use "Relay Model to Nano33" to forward it`)
+            myLoadModelPackageBytes(myKey, myFull)   // [CHANGED v14.2] factored out - shared with the paste-from-Serial path below
          } else {
             myDecodeWindow(myKey, myFull)
          }
       }
+   }
+
+   // [NEW v14.2] Shared "a model package's raw bytes just arrived" handler -
+   // used by both a completed BLE fetch (above) and the paste-from-Serial
+   // fallback (myLoadModelFromPastedHex, further down), so both paths end
+   // up in the exact same place with the exact same result.
+   function myLoadModelPackageBytes(myKey, myFull){
+      myLastReceivedModelBytes = myFull   // [NEW v02] stash so "Push to Nano33" can relay it verbatim
+      myModelInfo = { source: `fetched from ${myKey}`, paramCount: MY_MODEL_PACKAGE_FLOATS - 1,
+                       bytes: MY_MODEL_PACKAGE_BYTES, ts: new Date().toLocaleTimeString() }
+      myUpdateModelInfoPanel()
+      myLog(`${myKey}: got a MODEL PACKAGE (${myFull.byteLength} bytes) - use "Relay Model to Nano33" to forward it`)
+   }
+
+   // ======================================================
+   // [NEW v14] STALE BINARY-TRANSFER WATCHDOG - mirrors the 5s
+   // stale-transfer watchdog already in both .ino files' model-receive
+   // code. Without this, a transfer that stalls partway (e.g. the
+   // "Fetch ESP32 Model to Browser" bug fixed elsewhere in this v14 -
+   // or any other dropped indicate()) leaves myB.receiving stuck true
+   // FOREVER. Every future binary packet for that board then gets
+   // silently treated as "more of the old transfer" instead of "the
+   // start of a new one" - which is exactly what "the webpage doesn't
+   // always read the sent data properly" looks like from the outside:
+   // one failed fetch quietly poisons every Capture/Quick/Fetch after
+   // it, until the page is reloaded.
+   // [CHANGED v14.1] was 4000ms, which fired WHILE the ESP32 was still
+   // legitimately retrying a stuck BLE indicate() queue (see
+   // myIndicateWithRetry() in esp32-v14.ino, which now waits up to 3s
+   // per chunk on purpose - a real, recoverable BLE backlog, not a
+   // dead link). 4s was cutting that off mid-recovery. Bumped to 8s -
+   // comfortably longer than the ESP32's own 3s-per-chunk patience, so
+   // this only fires once the ESP32 side has ALSO given up (it aborts
+   // and stops sending entirely on a real failure), not while it's
+   // still working through a temporary backlog.
+   // ======================================================
+   setInterval(function(){
+      let myNow = Date.now()
+      for (let myKey in myBoards){
+         let myB = myBoards[myKey]
+         if (myB.receiving && (myNow - myB.lastChunkMs) > 8000){
+            myLog(`${myKey}: binary transfer stalled (${myB.receivedBytes}/${myB.expectedBytes} bytes, no data for 8s) - resetting so the next command starts clean`)
+            myB.receiving = false
+            myB.expectedBytes = 0
+            myB.receivedBytes = 0
+            myB.chunks = []
+         }
+      }
+   }, 1000)
+
+   // ======================================================
+   // [NEW v14.2] PASTE-FROM-SERIAL MODEL LOAD - a BLE-free fallback for
+   // "Fetch ESP32 Model to Browser", for machines/browsers where that
+   // BLE transfer isn't reliable. Run the 'e' Serial command on the
+   // ESP32, copy everything between its BEGIN/END markers, paste it
+   // into the textarea, click Load. Goes over USB Serial + clipboard
+   // instead of BLE, so it's immune to any BLE packet-size/queue/
+   // confirmation issue - it either has all the text or it doesn't.
+   // ======================================================
+   function myLoadModelFromPastedHex(myKey){
+      let myTextEl = document.getElementById('myPasteModel_' + myKey)
+      let myRaw = myTextEl.value
+      // strip the BEGIN/END marker lines (if pasted) and all whitespace/newlines
+      let myHex = myRaw.replace(/===MODEL_EXPORT_(BEGIN|END)===/g, '').replace(/\s+/g, '')
+      if (myHex.length === 0){
+         myLog(`${myKey}: paste box is empty - run 'e' on the board's Serial Monitor and paste the hex text first`)
+         return
+      }
+      if (!/^[0-9a-fA-F]+$/.test(myHex)){
+         myLog(`${myKey}: pasted text contains non-hex characters - check you copied the whole block cleanly`)
+         return
+      }
+      if (myHex.length % 2 !== 0){
+         myLog(`${myKey}: pasted hex has an odd number of characters (${myHex.length}) - looks truncated, try copying again`)
+         return
+      }
+      let myByteLen = myHex.length / 2
+      if (myByteLen !== MY_MODEL_PACKAGE_BYTES){
+         myLog(`${myKey}: pasted model is ${myByteLen} bytes, expected exactly ${MY_MODEL_PACKAGE_BYTES} - wrong architecture/class-count, or paste is incomplete`)
+         return
+      }
+      let myBytes = new Uint8Array(myByteLen)
+      for (let myI = 0; myI < myByteLen; myI++){
+         myBytes[myI] = parseInt(myHex.substr(myI * 2, 2), 16)
+      }
+      myLoadModelPackageBytes(myKey, myBytes)
+      myTextEl.value = ''
    }
 
    function myDecodeWindow(myKey, myBytes){
@@ -359,22 +506,60 @@ cross-check for the boards' on-device BLE result path).
    }
 
    // ======================================================
+   // [NEW v13] SHOW/HIDE THE NANO33 GRAPHS. Charts still update
+   // normally underneath (cheap enough not to bother skipping), this
+   // just hides the DOM elements - handy on a small screen or when the
+   // constant chart redraws are more distracting than useful. Plotly
+   // charts drawn while hidden can come back at the wrong size, so a
+   // resize is forced once they're shown again.
+   // ======================================================
+   function myToggleNanoGraphs(myShow){
+      let myHeart = document.getElementById('myHeartChart_nano')
+      let myWindow = document.getElementById('myWindowChart_nano')
+      myHeart.style.display = myShow ? 'block' : 'none'
+      myWindow.style.display = myShow ? 'block' : 'none'
+      if (myShow && window.Plotly){
+         setTimeout(function(){
+            try { Plotly.Plots.resize(myHeart) } catch (myErr) {}
+            try { Plotly.Plots.resize(myWindow) } catch (myErr) {}
+         }, 50)
+      }
+   }
+
+   // ======================================================
    // [NEW v02] ON-DEVICE INFERENCE RESULT: index-based CSV
    // "predIdx,conf,p0,p1,...,pN-1" from RESULT_CHAR notify.
    // Works the same whether it came from the ESP32's own trainer or
    // the Nano33 running a pushed model.
+   // [CHANGED v14] format now matches the firmware's own Serial output
+   // exactly (see myPrintResultLine() in both .ino files) - including
+   // the trailing comma before the closing paren, so the text on this
+   // page and the text in the Serial Monitor are byte-for-byte
+   // identical:  "1normal (0unknown=3%, 1normal=90%, 2issue=7%,)"
+   // [FIXED v14.1] myParts was being sliced from index 1, which only
+   // skips predIdx - it kept "conf" (a DUPLICATE of the predicted
+   // class's own probability, sent right after predIdx on purpose so
+   // Serial-only consumers don't need to hunt through the array for
+   // it) and mislabeled it as class 0's probability, shoving every
+   // real probability one slot too late. Since conf ~= the predicted
+   // class's real probability, this is exactly what made two classes
+   // show ~100% at once even though the board's own Serial Monitor -
+   // which never goes through this parsing - was correct the whole
+   // time. Now correctly skips BOTH predIdx and conf, leaving only
+   // the N-length p0..pN-1 array this function expects.
    // ======================================================
    function myHandleResult(myKey, myEvent){
       let myDecoder = new TextDecoder()
       let myText = myDecoder.decode(myEvent.target.value)
       let myParts = myText.split(',').map(parseFloat)
-      if (myParts.length < 2) { myLog(`${myKey}: bad result "${myText}"`); return }
+      if (myParts.length < 3) { myLog(`${myKey}: bad result "${myText}"`); return }
       let myPred = myParts[0]
-      let myProbs = myParts.slice(1)
+      let myProbs = myParts.slice(2)   // [FIXED v14.1] was slice(1) - that kept the duplicate "conf" field as if it were p0
       let myLabel = MY_CLASS_LABELS[myPred] || ('class#' + myPred)
-      let myOut = `${myLabel}  (` + myProbs.map(function(myP, myI){
-         return `${MY_CLASS_LABELS[myI] || myI}=${(myP*100).toFixed(0)}%`
-      }).join(', ') + ')'
+      let myBreakdown = myProbs.map(function(myP, myI){
+         return `${MY_CLASS_LABELS[myI] || ('class#' + myI)}=${(myP*100).toFixed(0)}%,`
+      }).join(' ')
+      let myOut = `${myLabel} (${myBreakdown})`
       document.getElementById('myResult_' + myKey).textContent = myOut
       myLog(`${myKey}: on-device result -> ${myOut}`)
    }
@@ -1092,9 +1277,10 @@ cross-check for the boards' on-device BLE result path).
       let myFwd = myForwardPass(myNorm, myM)
       let myPred = 0
       for (let myJ = 1; myJ < NUM_CLASSES; myJ++) if (myFwd.probs[myJ] > myFwd.probs[myPred]) myPred = myJ
-      let myOut = `${MY_CLASS_LABELS[myPred]}  (` + myFwd.probs.map(function(myP, myI){
-         return `${MY_CLASS_LABELS[myI]}=${(myP*100).toFixed(0)}%`
-      }).join(', ') + ')  [browser-side]'
+      let myBreakdown = myFwd.probs.map(function(myP, myI){
+         return `${MY_CLASS_LABELS[myI]}=${(myP*100).toFixed(0)}%,`
+      }).join(' ')
+      let myOut = `${MY_CLASS_LABELS[myPred]} (${myBreakdown})  [browser-side, JS forward pass]`
       if (myResultEl) myResultEl.textContent = myOut
       myLog(`${myKey}: browser-side inference -> ${myOut}`)
    }
@@ -1169,34 +1355,42 @@ cross-check for the boards' on-device BLE result path).
    }
 
    // Writes a model-package byte blob to a board's MODEL_CHAR, chunked
-   // with the same 4-byte-header + 180-byte-chunk pattern the firmware
-   // uses everywhere else. Works for either a browser-trained model
+   // with the same 4-byte-header + chunk pattern the firmware uses
+   // everywhere else. Works for either a browser-trained model
    // (myExportModelPackageBytes()) or a model just relayed in from the
    // other board (myLastReceivedModelBytes).
    //
-   // [CHANGED v11] Pushes to the Nano33 were hanging after the very
-   // first chunk. Root cause: its ~500ms heartbeat notify could land
-   // WHILE a chunked write from here was still outstanding, which can
-   // stall that write indefinitely on some OS Bluetooth stacks - fixed
-   // on the firmware side (heartbeat now pauses during a model push,
-   // nano33-v11.ino). To make this robust from the browser side too:
-   //   - prefer writeValueWithoutResponse() (matches the characteristic's
-   //     BLEWriteWithoutResponse property, avoids waiting on a response
-   //     that a stray notify could delay)
-   //   - a small delay between chunks, giving the board's loop()/BLE.poll()
-   //     time to actually consume each one before the next arrives
-   //   - a per-chunk timeout + one retry, so a genuinely stuck write is
-   //     reported clearly instead of hanging the button forever
-   //   - periodic progress logged to the on-page log, not just the bar
+   // [CHANGED v12] Still hanging partway through on the Nano33, even
+   // after v11's heartbeat fix - but the ESP32 (acting as central)
+   // pushes the exact same bytes to the Nano33 with no trouble at all.
+   // That's the key clue: the Nano33's receive logic is fine, so the
+   // problem is specifically how THIS BROWSER was sending chunks.
+   // v11 used writeValueWithoutResponse() for speed, which means the
+   // browser fires off chunk after chunk with no confirmation the
+   // Nano33 actually processed the previous one - nothing stops it
+   // from getting further ahead than the board's BLE stack can drain,
+   // unlike the ESP32-to-Nano33 link which (like most BLE central
+   // stacks doing a deliberate transfer) naturally paces writes to
+   // what the peripheral acknowledges.
+   // FIX: switch to write-WITH-response. The browser now waits for
+   // each chunk's ATT-level acknowledgement before sending the next,
+   // which is the same pacing the ESP32 link already had "for free."
+   // Slower, but this is the standard, reliable way to bulk-transfer
+   // data to an Arduino BLE peripheral - writeWithoutResponse is
+   // really meant for small, frequent, loss-tolerant telemetry, not
+   // a one-shot ~23KB payload. Also drops the Nano33's chunk size to
+   // 100 bytes (ESP32 unchanged at 180) as extra headroom, and blocks
+   // other control commands on a board while its push is in flight so
+   // nothing else can interleave on the connection.
    // ======================================================
    async function myWriteModelChunkWithRetry(myKey, myChunk, myChunkIdx, myChunkTotal){
       let myChar = myBoards[myKey].modelChar
       async function myAttempt(){
-         let myWritePromise = (typeof myChar.writeValueWithoutResponse === 'function')
-            ? myChar.writeValueWithoutResponse(myChunk)
-            : myChar.writeValue(myChunk)
+         let myWritePromise = (typeof myChar.writeValueWithResponse === 'function')
+            ? myChar.writeValueWithResponse(myChunk)
+            : myChar.writeValue(myChunk)   // per spec, writeValue() is a with-response alias
          let myTimeoutPromise = new Promise(function(myResolve, myReject){
-            setTimeout(function(){ myReject(new Error('chunk write timed out after 3s')) }, 3000)
+            setTimeout(function(){ myReject(new Error('chunk write timed out after 4s')) }, 4000)
          })
          await Promise.race([myWritePromise, myTimeoutPromise])
       }
@@ -1219,14 +1413,15 @@ cross-check for the boards' on-device BLE result path).
       }
       let myBar = document.getElementById('myPushProgress')
       myBar.max = myBytes.length; myBar.value = 0; myBar.style.display = 'inline-block'
+      myBoards[myKey].pushInProgress = true   // [NEW v12] see myWriteControl() - blocks other commands to this board meanwhile
       try {
          let myHeader = new Uint8Array(4)
          let myHV = new DataView(myHeader.buffer)
          myHV.setUint32(0, myBytes.length, true)
-         await myBoards[myKey].modelChar.writeValue(myHeader)
-         myLog(`${myKey}: model push starting, ${myBytes.length} bytes`)
+         await myBoards[myKey].modelChar.writeValueWithResponse(myHeader)
+         myLog(`${myKey}: model push starting, ${myBytes.length} bytes (write-with-response, paced)`)
 
-         const myChunkSize = 180
+         const myChunkSize = (myKey === 'nano') ? 100 : 180   // [NEW v12] extra headroom on the Nano33 specifically
          const myChunkTotal = Math.ceil(myBytes.length / myChunkSize)
          let myChunkIdx = 0
          let myLastLoggedPct = -1
@@ -1240,12 +1435,13 @@ cross-check for the boards' on-device BLE result path).
                myLog(`${myKey}: pushing model... ${myBar.value}/${myBytes.length} bytes (${myPct}%)`)
                myLastLoggedPct = myPct
             }
-            await new Promise(function(myResolve){ setTimeout(myResolve, 8) })   // pace chunks so the board's loop() keeps up
+            await new Promise(function(myResolve){ setTimeout(myResolve, 10) })   // small breathing room on top of the with-response ack
          }
          myLog(`${myKey}: model push complete (${myBytes.length} bytes) - on the Nano33 this loads instantly; check its Serial Monitor or run "Infer" to confirm`)
       } catch (myErr) {
-         myLog(`${myKey}: model push error - ${myErr} (if this was the Nano33 hanging after the first chunk, make sure it's running nano33-v11.ino or later)`)
+         myLog(`${myKey}: model push error - ${myErr} (if this was the Nano33 still hanging partway, try Disconnect + Connect again before retrying)`)
       } finally {
+         myBoards[myKey].pushInProgress = false
          setTimeout(function(){ myBar.style.display = 'none' }, 1500)
       }
    }
@@ -1446,9 +1642,10 @@ Custom command: <input type=text id="myCustomCmd_nano" value="" size=15>
 <input type=button value="Send" onclick="mySendCustom('nano')"><br><br>
 
 On-device result: <b><span id="myResult_nano">no model loaded yet</span></b>
-<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('nano')"><br><br>
+<input type=button value="Run Browser Inference (JS cross-check)" title="Runs the CURRENT browser model against the last CAPTURED window, entirely in JavaScript - no BLE involved. Useful to check whether a bad result is the model/data, or the board's own on-device BLE result path." onclick="myRunBrowserInference('nano')"><br><br>
 
 Heartbeat: <span id="myHeartText_nano">...</span>
+<label style="margin-left:10px;"><input type=checkbox id="myNanoGraphsToggle" checked onchange="myToggleNanoGraphs(this.checked)"> Show graphs</label>
 <div id="myHeartChart_nano" style="width:100%; height:300px;"></div>
 
 <div id="myWindowChart_nano" style="width:100%; height:300px;"></div>
@@ -1469,13 +1666,25 @@ Status: <span id="myStatus_esp">not connected</span><br><br>
 <input type=button value="Infer" style="background-color:khaki;" onclick="myWriteControl('esp','INFER')">
 <input type=button value="Quick Infer" style="background-color:khaki;" onclick="myWriteControl('esp','QUICKINFER')"><br>
 <input type=button value="Push Model to Nano33" onclick="myWriteControl('esp','PUSHTONANO')">
-<input type=button value="Fetch ESP32 Model to Browser" onclick="myWriteControl('esp','PUSHMODEL')"><br>
+<input type=button value="Fetch ESP32 Model to Browser" title="Over BLE. If this keeps stalling on your machine, use the 'e' Serial command + paste box below instead - same result, no BLE size limit." onclick="myWriteControl('esp','PUSHMODEL')"><br>
 <input type=button value="Relay Fetched Model to Nano33" onclick="myRelayReceivedModelToNano()"><br>
+<!-- [NEW v14.2] BLE-free fallback for the fetch above -->
+<details style="margin-top:6px;">
+<summary>Paste Model From Serial (fallback if the Fetch button above keeps stalling)</summary>
+<div style="margin-top:6px;">
+On the ESP32's own USB Serial Monitor, type <code>e</code> and press enter. Select everything between (not
+including) the <code>===MODEL_EXPORT_BEGIN===</code> / <code>===MODEL_EXPORT_END===</code> lines, copy it, and
+paste it below - goes over USB instead of BLE, so it isn't affected by the stall above.<br>
+<textarea id="myPasteModel_esp" rows=4 style="width:95%;" placeholder="Paste the hex text from the ESP32's 'e' command here..."></textarea><br>
+<input type=button value="Load Pasted Model" onclick="myLoadModelFromPastedHex('esp')">
+</div>
+</details>
+<br>
 Custom command: <input type=text id="myCustomCmd_esp" value="" size=15>
 <input type=button value="Send" onclick="mySendCustom('esp')"><br><br>
 
 On-device result: <b><span id="myResult_esp">no model loaded yet</span></b>
-<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('esp')"><br><br>
+<input type=button value="Run Browser Inference (JS cross-check)" title="Runs the CURRENT browser model against the last CAPTURED window, entirely in JavaScript - no BLE involved. Useful to check whether a bad result is the model/data, or the board's own on-device BLE result path." onclick="myRunBrowserInference('esp')"><br><br>
 
 Heartbeat: <span id="myHeartText_esp">...</span>
 <div id="myHeartChart_esp" style="width:100%; height:300px;"></div>
@@ -1495,7 +1704,7 @@ channels are sent as 0. Best for quick gesture-shape demos - see the code commen
 Status: <span id="myPhoneStatus">not enabled yet</span><br><br>
 
 On-device result: <b><span id="myResult_phone">n/a - a phone has no on-device model, this runs in the browser</span></b>
-<input type=button value="Run Browser Inference" onclick="myRunBrowserInference('phone')"><br>
+<input type=button value="Run Browser Inference (JS)" title="Runs the current browser model against the last captured phone-motion window, entirely in JavaScript. This is the ONLY way to get a phone result - a phone isn't a BLE board." onclick="myRunBrowserInference('phone')"><br>
 <input type=button id="myPhoneContinuousBtn" value="Start Continuous Inference" style="background-color:lime;" onclick="myTogglePhoneContinuousInference()">
 <span style="color:#555;">- auto capture + predict, roughly once a second, until stopped</span><br><br>
 
@@ -1595,7 +1804,9 @@ Service UUID: 7e400001-b2c3-5d4e-af60-9b3c7d8eaf20<br>
 Control char (write): 7e400002-... - browser sends "CAPTURE", "QUICK", "TRAIN", "INFER", "QUICKINFER",
 "PUSHTONANO", or "PUSHMODEL" as plain ASCII text (Nano33 only understands CAPTURE/QUICK/INFER/QUICKINFER - it never trains)<br>
 Heartbeat char (notify, ~2Hz): 7e400003-... - CSV text "ax,ay,az,mic,temp,hum,prox"<br>
-Binary char (indicate, chunked): 7e400004-... - 4-byte little-endian uint32 length header, then raw float32LE
+Binary char (notify, chunked) [CHANGED v14.2 - was indicate on the ESP32 side; the Nano33's binary char is still
+indicate, since its transfers are small (up to ~1.6KB) and haven't shown this issue]: 7e400004-... - 4-byte
+little-endian uint32 length header, then raw float32LE
 payload in ~180-byte chunks. 407 floats = full 1-second window, 17 floats = QUICK reading, 5872 floats = a full
 MODEL PACKAGE (only sent by the ESP32 in response to "PUSHMODEL").<br>
 Model char (write, chunked) [NEW v02]: 7e400005-... - same 4-byte-header + chunk pattern, browser -> board,
@@ -1605,8 +1816,44 @@ by whichever board just ran the forward pass.<br>
 myFusionWeights.h [NEW v09]: not BLE - a plain-text C++ header download (Save myWeights.h button) with the same
 numbers as the .bin, for baking a model into either sketch at compile time (USE_BAKED_WEIGHTS).<br>
 Phone motion training [NEW v09]: not BLE either - uses the browser's own DeviceMotionEvent API on the phone/tablet
-the page is open on, feeding straight into the same labeled dataset as the two boards.
+the page is open on, feeding straight into the same labeled dataset as the two boards.<br>
+On-device result text format [CHANGED v14]: both boards' Serial Monitor AND this page's "On-device result" line
+now use the exact same format, produced by one shared function on each board (myPrintResultLine in both .ino
+files): "On-device result: 1normal (0unknown=3%, 1normal=90%, 2issue=7%,)" - the trailing comma before the
+closing paren is intentional (falls out of the shared per-class loop), kept so the two are byte-for-byte identical.
 </p>
+
+<!-- ---- [NEW v14] SERIAL MONITOR COMMAND REFERENCE ---- -->
+<p>
+Serial Monitor commands (type these into each board's own USB Serial Monitor at 115200 baud - these are
+NOT sent over BLE, they only work with a USB cable plugged into that specific board):<br><br>
+<b>Nano33</b> (nano33-v14.ino) - no training on this board by design:<br>
+&nbsp;&nbsp;<code>i</code> = Infer once/continuous (real 1s window, 'x' to stop)<br>
+&nbsp;&nbsp;<code>q</code> = Quick continuous infer (fast replicated reading, 'x' to stop)<br>
+&nbsp;&nbsp;<code>s</code> = status (BLE connection + model-loaded state)<br>
+&nbsp;&nbsp;<code>d</code> = toggle debug output [NEW v14] (verbose per-timestep sampling lines)<br>
+&nbsp;&nbsp;<code>z</code> = reset (restart the board)<br>
+&nbsp;&nbsp;<code>?</code> = show this menu<br><br>
+<b>ESP32S3</b> (esp32-v14.ino):<br>
+&nbsp;&nbsp;<code>1</code>-<code>3</code> = Collect a sample for that class (then <code>c</code> to capture, <code>x</code> to exit)<br>
+&nbsp;&nbsp;<code>t</code> = Train (on-device, from SD-collected samples)<br>
+&nbsp;&nbsp;<code>i</code> = Infer once/continuous (real 1s window, 'x' to stop)<br>
+&nbsp;&nbsp;<code>q</code> = Quick continuous infer (fast replicated reading, 'x' to stop)<br>
+&nbsp;&nbsp;<code>r</code> = (re)connect to the Nano33<br>
+&nbsp;&nbsp;<code>k</code> = recalibrate<br>
+&nbsp;&nbsp;<code>s</code> = status<br>
+&nbsp;&nbsp;<code>p</code> = push the current model to the Nano33 for on-device inference<br>
+&nbsp;&nbsp;<code>e</code> = export the current model as pasteable hex text [NEW v14.2] - BLE-free fallback, see "Paste Model From Serial" on this page<br>
+&nbsp;&nbsp;<code>d</code> = toggle debug output (verbose BLE/transfer diagnostics)<br>
+&nbsp;&nbsp;<code>b</code> = cycle BLE mode (Dual / Peripheral only / Central only / Off)<br>
+&nbsp;&nbsp;<code>z</code> = restart now, to apply a newly-selected BLE mode<br>
+&nbsp;&nbsp;<code>?</code> = show this menu<br><br>
+The <b>Control char</b> commands above ("CAPTURE", "QUICK", etc) are the separate BLE-over-the-air command set this
+webpage actually sends - use the "Custom command" box on either board's panel to send any of these, or the single
+letters 'r'/'k'/'s' (the ESP32 also accepts those same letters over BLE, not just USB Serial).
+</p>
+
+<hr>
 
 By Jeremy Ellis @rocksetta<br>
 Use at your own risk!
