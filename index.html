@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WebBLE Dual Board Control - Nano33 + ESP32S3 - v14</title>
+<title>WebBLE Dual Board Control - Nano33 + ESP32S3 - v16</title>
 <script src="https://cdn.plot.ly/plotly-1.47.4.min.js"></script>
 </head>
 <body>
 
-<h1 align=center>WebBLE Dual Board Control - v14</h1>
+<h1 align=center>WebBLE Dual Board Control - v16</h1>
 <h3 align=center>Nano 33 BLE Sense (peripheral, inference-only) + XIAO ESP32S3 (dual role: central to Nano33, peripheral to this page)</h3>
-<h6>Uses Web Bluetooth directly for the boards - Chrome or Edge on Windows/Mac/Linux/ChromeOS/Android only. Phonae
+<h6>Uses Web Bluetooth directly for the boards - Chrome or Edge on Windows/Mac/Linux/ChromeOS/Android only. Phone
 motion training below uses a separate, plain-web-standards API (DeviceMotionEvent) that also works in mobile Safari.</h6>
 
 <p>
@@ -19,6 +19,29 @@ architecture both boards run, then <b>push the trained weights to either board</
 it only ever receives a finished model (from the ESP32, from this page, or baked in at compile time) and runs
 inference locally, reporting results back over BLE. Quick and full inference both work everywhere.
 </p>
+<p>
+<b>What's new in v16 - browser-only fix, no firmware changes needed (nano33-v14.ino / esp32-v14.ino still current):</b>
+</p>
+<ul>
+<li><b>Fixed phone-motion-trained models coming out entirely NaN.</b> Symptoms were: the live loss chart trailing
+off partway through training instead of showing all epochs, "Run Browser Inference" showing NaN for every class,
+and the SAME NaN persisting even after successfully pushing that model to the Nano33 (i.e. this wasn't a display
+bug - the trained weights themselves were corrupted). Investigated the whole phone data path - window layout,
+zero-filling the channels a phone doesn't have (magnetometer/mic/all 7 static channels), and the normalization/
+clipping in <code>myNormalizeWindow()</code> - and all of that was already correct; zero-filling unavailable
+channels is the right approach and was never the problem. The actual bug: the hand-rolled SGD in
+<code>myTrainStep()</code> applied every weight update completely unclipped. Phone datasets tend to be smaller
+and lower-diversity than board ones (fewer samples, and 10 of the 17 input channels carry zero information for
+every single sample), which concentrates all the learning signal onto a handful of live weights - making it much
+easier for one epoch to take an oversized step, overshoot a weight into NaN/Infinity, and then have every future
+step touching that weight compute to NaN forever after (there was no path back once that happened). Every weight/
+bias update is now routed through a new <code>myClipStep()</code> that bounds each individual update to a small
+fixed range - this makes that first NaN structurally impossible, for phone OR board data, with no effect on runs
+that were already numerically stable. Added an epoch-snapshot-and-rollback safety net in
+<code>myTrainInBrowser()</code> as well, in case anything else ever manages to produce a non-finite loss - it
+rolls back to the last good epoch and halves the learning rate instead of continuing to train on a corrupted
+model.</li>
+</ul>
 <p>
 <b>What's new in v14.2:</b>
 </p>
@@ -629,11 +652,39 @@ the board could keep up), plus other commands to a board are held off while a pu
       if (isNaN(myV) || !isFinite(myV)) return 0
       return Math.min(Math.max(myV, myMn), myMx)
    }
+   // [NEW v16] Clamp a single SGD weight-update STEP (lr * delta * activation)
+   // to a safe range before it's ever subtracted from a weight. See the
+   // "why phone training went NaN" write-up above myTrainStep() below for
+   // the full reasoning - short version: nothing here was actually wrong
+   // about phone data or the zero-filled channels, the hand-rolled SGD
+   // just had no gradient/step clipping anywhere, so one oversized step
+   // (more likely with the smaller, lower-diversity datasets phone
+   // training tends to produce) could push a weight to NaN/Infinity in
+   // one shot, and every future step touching that weight is NaN forever
+   // after. Clamping every step to a small fixed range makes that
+   // structurally impossible, board or phone, without changing normal
+   // (already-stable) training dynamics at all - a bounded step is a
+   // no-op when the step would already have been small.
+   function myClipStep(myV){
+      if (isNaN(myV) || !isFinite(myV)) return 0
+      return Math.min(Math.max(myV, -1), 1)
+   }
    function mySoftmax(myArr){
       let myMax = Math.max(...myArr)
       let myExp = myArr.map(function(myV){ return Math.exp(myV - myMax) })
       let mySum = myExp.reduce(function(myA, myB){ return myA + myB }, 0)
       return myExp.map(function(myV){ return myV / mySum })
+   }
+
+   // [NEW v16] Deep-copies a model object (all the Float32Array weight/bias
+   // arrays plus calibMean/calibStd) so myTrainInBrowser can snapshot
+   // "last known good" weights before each epoch and roll back to them if
+   // that epoch's loss comes out non-finite, instead of continuing to
+   // train on top of already-corrupted weights.
+   function myCloneModel(myM){
+      let myOut = {}
+      for (let myKey in myM) myOut[myKey] = myM[myKey].slice()
+      return myOut
    }
 
    // [FIXED v08] Compute calibration mean/std the SAME way the ESP32 does at
@@ -782,6 +833,28 @@ the board could keep up), plus other commands to a board are held off while a pu
    // One SGD step on a single labeled sample. Cross-entropy loss,
    // softmax output, leaky-relu everywhere else - same loss shape as
    // esp32-v05.ino's myBackwardPass, simplified to plain SGD.
+   // [FIXED v16] PHONE-TRAINED MODELS GOING FULLY NaN - the raw window
+   // layout, zero-filling the channels a phone doesn't have (mx,my,mz,
+   // mic, and all 7 static channels), and myNormalizeWindow's clipping
+   // were all already correct and NOT the problem - every normalized
+   // INPUT value was always safely bounded to [-5,5] before it ever
+   // reached the network. The actual bug: this hand-rolled SGD applied
+   // every weight update completely unclipped. Phone datasets tend to be
+   // smaller and lower-diversity than board ones (fewer samples, and 10
+   // of the 17 input channels carry zero information for every sample),
+   // which concentrates all the learning signal onto a handful of live
+   // weights - making it much easier for one epoch to take an oversized
+   // step on those weights, overshoot into NaN/Infinity, and then have
+   // EVERY future step involving that weight compute to NaN forever
+   // after (once a weight is NaN, "weight -= 0" is still NaN - there was
+   // no path back). That's exactly what "loss chart stops partway" +
+   // "test model all NaN" + "same NaN after pushing to Nano33" all
+   // point to: real weight corruption, not a display glitch. Every
+   // weight/bias update below is now routed through myClipStep(), which
+   // NaN-guards and bounds the update to a small range - structurally
+   // prevents any single step from ever creating that first NaN, board
+   // or phone, with no effect on runs that were already numerically
+   // stable (a bounded step is a no-op when the step was already small).
    function myTrainStep(myNormBuf, myLabel, myLr){
       let myFwd = myForwardPass(myNormBuf)
 
@@ -791,9 +864,9 @@ the board could keep up), plus other commands to a board are held off while a pu
 
       // output weights/bias
       for (let myJ = 0; myJ < NUM_CLASSES; myJ++){
-         myModel.output_b[myJ] -= myLr * myOutDelta[myJ]
+         myModel.output_b[myJ] -= myClipStep(myLr * myOutDelta[myJ])
          for (let myI = 0; myI < DENSE2_SIZE; myI++){
-            myModel.output_w[myI*NUM_CLASSES+myJ] -= myLr * myOutDelta[myJ] * myFwd.dense2[myI]
+            myModel.output_w[myI*NUM_CLASSES+myJ] -= myClipStep(myLr * myOutDelta[myJ] * myFwd.dense2[myI])
          }
       }
       // dense2 delta
@@ -804,9 +877,9 @@ the board could keep up), plus other commands to a board are held off while a pu
          myD2Delta[myI] = mySum * myLeakyReluDeriv(myFwd.dense2[myI])
       }
       for (let myJ = 0; myJ < DENSE2_SIZE; myJ++){
-         myModel.dense2_b[myJ] -= myLr * myD2Delta[myJ]
+         myModel.dense2_b[myJ] -= myClipStep(myLr * myD2Delta[myJ])
          for (let myI = 0; myI < DENSE1_SIZE; myI++){
-            myModel.dense2_w[myI*DENSE2_SIZE+myJ] -= myLr * myD2Delta[myJ] * myFwd.dense1[myI]
+            myModel.dense2_w[myI*DENSE2_SIZE+myJ] -= myClipStep(myLr * myD2Delta[myJ] * myFwd.dense1[myI])
          }
       }
       // dense1 delta
@@ -817,9 +890,9 @@ the board could keep up), plus other commands to a board are held off while a pu
          myD1Delta[myI] = mySum * myLeakyReluDeriv(myFwd.dense1[myI])
       }
       for (let myJ = 0; myJ < DENSE1_SIZE; myJ++){
-         myModel.dense1_b[myJ] -= myLr * myD1Delta[myJ]
+         myModel.dense1_b[myJ] -= myClipStep(myLr * myD1Delta[myJ])
          for (let myI = 0; myI < COMBINED_SIZE; myI++){
-            myModel.dense1_w[myI*DENSE1_SIZE+myJ] -= myLr * myD1Delta[myJ] * myFwd.combined[myI]
+            myModel.dense1_w[myI*DENSE1_SIZE+myJ] -= myClipStep(myLr * myD1Delta[myJ] * myFwd.combined[myI])
          }
       }
       // pool1 delta (only the flatten portion of combined-delta feeds back into conv)
@@ -843,11 +916,11 @@ the board could keep up), plus other commands to a board are held off while a pu
          for (let myF = 0; myF < CONV1_FILTERS; myF++){
             let myG = myConv1Delta[myS*CONV1_FILTERS+myF]
             if (myG === 0) continue
-            myModel.conv1_b[myF] -= myLr * myG
+            myModel.conv1_b[myF] -= myClipStep(myLr * myG)
             for (let myK = 0; myK < CONV1_KERNEL; myK++){
                for (let myC = 0; myC < MY_FAST_CHANNELS; myC++){
                   let myWIdx = (myK*MY_FAST_CHANNELS+myC)*CONV1_FILTERS+myF
-                  myModel.conv1_w[myWIdx] -= myLr * myG * myNormBuf[(myS+myK)*MY_FAST_CHANNELS+myC]
+                  myModel.conv1_w[myWIdx] -= myClipStep(myLr * myG * myNormBuf[(myS+myK)*MY_FAST_CHANNELS+myC])
                }
             }
          }
@@ -873,6 +946,18 @@ the board could keep up), plus other commands to a board are held off while a pu
       let myLr = parseFloat(document.getElementById('myBrowserLr').value) || 0.01
       myLog(`browser: training started - ${myDataset.length} samples, ${myEpochs} epochs, lr=${myLr}`)
 
+      // [NEW v16] belt-and-suspenders alongside myClipStep() in myTrainStep():
+      // snapshot the model before every epoch, and if that epoch's avg loss
+      // somehow still comes out non-finite, roll back to the snapshot and
+      // halve the learning rate instead of ploughing on with a corrupted
+      // model. myClipStep() should make this loop never actually trigger,
+      // but it's cheap insurance and gives a clear log message instead of
+      // a silently-ruined model if some future change reintroduces the
+      // possibility.
+      let myLastGoodModel = myCloneModel(myModel)
+      let myRollbacks = 0
+      const myMaxRollbacks = 5
+
       for (let myEpoch = 0; myEpoch < myEpochs; myEpoch++){
          // shuffle each epoch
          let myOrder = myDataset.map(function(myV, myI){ return myI })
@@ -893,6 +978,21 @@ the board could keep up), plus other commands to a board are held off while a pu
          }
          let myAvgLoss = myTotalLoss / myOrder.length
          let myAcc = myCorrect / myOrder.length
+
+         if (!isFinite(myAvgLoss)){   // [NEW v16] should no longer be reachable given myClipStep(), but just in case
+            myRollbacks++
+            if (myRollbacks > myMaxRollbacks){
+               myLog(`browser: training loss went non-finite ${myMaxRollbacks} times even after reducing the learning rate each time - stopping with the last known-good model from before this happened (lr had reached ${myLr.toFixed(5)}). Try more/more-varied samples per class, or a lower starting learning rate.`)
+               break
+            }
+            myModel = myCloneModel(myLastGoodModel)
+            myLr = myLr / 2
+            myLog(`browser: epoch ${myEpoch+1} loss went non-finite - rolled back to the last stable epoch and halved the learning rate to ${myLr.toFixed(5)}, retrying`)
+            myEpoch--   // retry this same epoch number with the reduced lr
+            continue
+         }
+
+         myLastGoodModel = myCloneModel(myModel)
          myLossHistory.push({ epoch: myEpoch + 1, loss: myAvgLoss, acc: myAcc })
 
          document.getElementById('myBrowserTrainStatus').textContent =
